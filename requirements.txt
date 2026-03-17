@@ -66,7 +66,7 @@ tomli==2.2.1
 torch==2.4.0
 torchvision==0.19.0
 tqdm==4.66.4
-transformers==4.38.2
+
 triton==3.0.0
 tzdata==2024.2
 urllib3==2.3.0
@@ -78,3 +78,4 @@ google-genai
 typing_extensions
 setuptools
 accelerate
+transformers
