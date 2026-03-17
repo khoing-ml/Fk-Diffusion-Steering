@@ -15,7 +15,7 @@ from fkd_diffusers.rewards import (
     do_llm_grading
 )
 
-
+c
 def get_model(model_name):
     """
     Get the FKD-supported model based on the model name.
@@ -27,7 +27,7 @@ def get_model(model_name):
     elif model_name == "stable-diffusion-v1-4":
         pipeline = FKDStableDiffusion.from_pretrained("CompVis/stable-diffusion-v1-4", torch_dtype=torch.float16)
     elif model_name == "stable-diffusion-2-1":
-        pipeline = FKDStableDiffusion.from_pretrained("stabilityai/stable-diffusion-2-1", torch_dtype=torch.float16)
+        pipeline = FKDStableDiffusion.from_pretrained("sd2-community/stable-diffusion-2-1", torch_dtype=torch.float16)
     else:
         raise ValueError(f"Unknown model name: {model_name}")
     
