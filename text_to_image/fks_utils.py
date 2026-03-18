@@ -15,7 +15,7 @@ from fkd_diffusers.rewards import (
     do_llm_grading
 )
 
-c
+
 def get_model(model_name):
     """
     Get the FKD-supported model based on the model name.
