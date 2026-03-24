@@ -4,8 +4,13 @@ import torch.nn.functional as F
 import clip
 import hpsv2
 
-from image_reward_utils import rm_load
-from llm_grading import LLMGrader
+try:
+    from .image_reward_utils import rm_load
+    from .llm_grading import LLMGrader
+except ImportError:
+    # Fallback for direct script execution from this directory.
+    from image_reward_utils import rm_load
+    from llm_grading import LLMGrader
 
 # Stores the reward models
 REWARDS_DICT = {
