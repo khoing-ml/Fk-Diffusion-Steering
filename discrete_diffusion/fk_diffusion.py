@@ -66,6 +66,26 @@ def compute_rewards(*, samples, reward_name, reward_label):
     return scores
 
 
+def evolution_steering_binary_rewards(rewards, threshold_fn):
+    """
+    Compute binary rewards for evolution steering using existing reward scores.
+
+    Args:
+        rewards: List of reward scores for the samples.
+        threshold_fn: Function to compute the threshold for scoring.
+
+    Returns:
+        Binary rewards (0 or 1) for each sample.
+    """
+    # Determine the threshold
+    threshold = threshold_fn(rewards)
+
+    # Assign binary rewards
+    binary_rewards = [1 if r >= threshold else 0 for r in rewards]
+
+    return binary_rewards
+
+
 class FKDiffusion(Diffusion):
     '''
     FK Steering on Diffusion Model from MDLM

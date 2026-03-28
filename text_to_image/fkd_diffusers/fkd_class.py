@@ -84,7 +84,7 @@ class FKD:
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Perform resampling of particles if conditions are met.
-        Should be invoked at each timestep in the reverse diffusion process.
+        Includes binary scoring for evolution steering using existing reward functions.
 
         Args:
             sampling_idx: Current sampling index (timestep).
@@ -98,83 +98,30 @@ class FKD:
         resampling_interval = np.arange(
             self.resampling_t_start, self.resampling_t_end + 1, self.resample_frequency
         )
-        resampling_interval = np.append(resampling_interval, self.time_steps - 1)
 
         if sampling_idx not in resampling_interval:
             return latents, None
 
-        # Decode latents to population images and compute rewards
-        population_images = self.latent_to_decode_fn(x0_preds)
-        rs_candidates = self.reward_fn(population_images)
+        # Decode latents to images (if applicable)
+        decoded_images = self.latent_to_decode_fn(latents)
 
-        # Compute importance weights
-        if self.potential_type == PotentialType.MAX:
-            rs_candidates = torch.max(rs_candidates, self.population_rs)
-            w = torch.exp(self.lmbda * rs_candidates)
-        elif self.potential_type == PotentialType.ADD:
-            rs_candidates = rs_candidates + self.population_rs
-            w = torch.exp(self.lmbda * rs_candidates)
-        elif self.potential_type == PotentialType.DIFF:
-            diffs = rs_candidates - self.population_rs
-            w = torch.exp(self.lmbda * diffs)
-        elif self.potential_type == PotentialType.RT:
-            w = torch.exp(self.lmbda * rs_candidates)
-        else:
-            raise ValueError(f"potential_type {self.potential_type} not recognized")
+        # Compute rewards using the existing reward function
+        rewards = self.reward_fn(decoded_images)
 
-        if sampling_idx == self.time_steps - 1:
-            if (
-                self.potential_type == PotentialType.MAX
-                or self.potential_type == PotentialType.ADD
-                or self.potential_type == PotentialType.RT
-            ):
-                w = torch.exp(self.lmbda * rs_candidates) / self.product_of_potentials
+        # Compute binary rewards
+        binary_rewards = evolution_steering_binary_rewards(
+            rewards=rewards, threshold_fn=lambda rewards: np.percentile(rewards, 50)
+        )
 
-        w = torch.clamp(w, 0, 1e10)
-        w[torch.isnan(w)] = 0.0
+        # Resample based on binary rewards
+        resampled_indices = torch.multinomial(
+            torch.tensor(binary_rewards, dtype=torch.float32),
+            num_samples=self.num_particles,
+            replacement=True
+        )
 
-        if self.adaptive_resampling or sampling_idx == self.time_steps - 1:
-            # compute effective sample size
-            normalized_w = w / w.sum()
-            ess = 1.0 / (normalized_w.pow(2).sum())
-
-            if ess < 0.5 * self.num_particles:
-                print(f"Resampling at timestep {sampling_idx} with ESS: {ess}")
-                # Resample indices based on weights
-                indices = torch.multinomial(
-                    w, num_samples=self.num_particles, replacement=True
-                )
-                resampled_latents = latents[indices]
-                self.population_rs = rs_candidates[indices]
-
-                # Resample population images
-                resampled_images = population_images[indices]
-
-                # Update product of potentials; used for max and add potentials
-                self.product_of_potentials = (
-                    self.product_of_potentials[indices] * w[indices]
-                )
-            else:
-                # No resampling
-                resampled_images = population_images
-                resampled_latents = latents
-                self.population_rs = rs_candidates
-
-        else:
-            # Resample indices based on weights
-            indices = torch.multinomial(
-                w, num_samples=self.num_particles, replacement=True
-            )
-            resampled_latents = latents[indices]
-            self.population_rs = rs_candidates[indices]
-
-            # Resample population images
-            resampled_images = population_images[indices]
-
-            # Update product of potentials; used for max and add potentials
-            self.product_of_potentials = (
-                self.product_of_potentials[indices] * w[indices]
-            )
+        resampled_latents = latents[resampled_indices]
+        resampled_images = decoded_images[resampled_indices] if decoded_images is not None else None
 
         return resampled_latents, resampled_images
 
