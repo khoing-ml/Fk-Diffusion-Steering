@@ -8,7 +8,7 @@ logs/
 # C extensions
 *.so
 discrete_diffusion/outputs/
-discrete_diffusion/src/
+discrete_diffusion/src/diffusers
 text_to_image/fkd_diffusers/train_samples_sdv15/
 discrete_diffusion/mdlm
 
