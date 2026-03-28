@@ -4,14 +4,6 @@ import torch.nn.functional as F
 import clip
 import hpsv2
 
-try:
-    from .image_reward_utils import rm_load
-    from .llm_grading import LLMGrader
-except ImportError:
-    # Fallback for direct script execution from this directory.
-    from image_reward_utils import rm_load
-    from llm_grading import LLMGrader
-
 # Stores the reward models
 REWARDS_DICT = {
     "Clip-Score": None,
@@ -86,7 +78,20 @@ def do_clip_score_diversity(*, images, prompts):
 def do_image_reward(*, images, prompts):
     global REWARDS_DICT
     if REWARDS_DICT["ImageReward"] is None:
-        REWARDS_DICT["ImageReward"] = rm_load("ImageReward-v1.0")
+        try:
+            try:
+                from .image_reward_utils import rm_load
+            except ImportError:
+                # Fallback for direct script execution from this directory.
+                from image_reward_utils import rm_load
+            REWARDS_DICT["ImageReward"] = rm_load("ImageReward-v1.0")
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to initialize ImageReward. This is often caused by a broken "
+                "wandb/protobuf installation in the runtime. "
+                "Try either: (1) install compatible wandb/protobuf, or "
+                "(2) run with --guidance-reward-fn Clip-Score."
+            ) from exc
 
     with torch.no_grad():
         image_reward_result = REWARDS_DICT["ImageReward"].score_batched(prompts, images)
@@ -112,7 +117,14 @@ def do_llm_grading(*, images, prompts, metric_to_chase="overall_score"):
     global REWARDS_DICT
     
     if REWARDS_DICT["LLMGrader"] is None:
-        REWARDS_DICT["LLMGrader"]  = LLMGrader()
+        try:
+            try:
+                from .llm_grading import LLMGrader
+            except ImportError:
+                from llm_grading import LLMGrader
+            REWARDS_DICT["LLMGrader"]  = LLMGrader()
+        except Exception as exc:
+            raise RuntimeError("Failed to initialize LLMGrader backend.") from exc
     llm_grading_result = [
         REWARDS_DICT["LLMGrader"].score(images=images[i], prompts=prompt, metric_to_chase=metric_to_chase)
         for i, prompt in enumerate(prompts)

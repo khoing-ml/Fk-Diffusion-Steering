@@ -225,8 +225,12 @@ def run_mode(
         fkd_args=fkd_args,
     )[0]
 
-    results = do_eval(prompt=prompts, images=images, metrics_to_compute=["ImageReward"])
-    rewards = np.array(results["ImageReward"]["result"])
+    metric_name = guidance_reward_fn
+    if metric_name not in {"ImageReward", "Clip-Score", "HumanPreference", "LLMGrader", "Clip-Score-only"}:
+        metric_name = "ImageReward"
+
+    results = do_eval(prompt=prompts, images=images, metrics_to_compute=[metric_name])
+    rewards = np.array(results[metric_name]["result"])
 
     order = np.argsort(rewards)[::-1]
     images_sorted = [images[i] for i in order]
@@ -336,7 +340,7 @@ def main() -> None:
             "args": fkd_args,
         }
 
-    print("\nImageReward summary:")
+    print(f"\n{args.guidance_reward_fn} summary:")
     for mode in modes:
         s = all_scores[mode]
         print(

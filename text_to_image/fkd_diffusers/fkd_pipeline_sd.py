@@ -15,8 +15,12 @@ import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
 # Added for FK Steering
-from fkd_class import FKD
-from rewards import get_reward_function
+try:
+    from .fkd_class import FKD
+    from .rewards import get_reward_function
+except ImportError:
+    from fkd_class import FKD
+    from rewards import get_reward_function
 
 import torch
 from packaging import version
