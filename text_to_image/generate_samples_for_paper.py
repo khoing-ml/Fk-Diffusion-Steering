@@ -107,6 +107,7 @@ def generate_samples(fkd_args, pipeline, prompt_data):
 
         max_fname = os.path.join(image_fpath, f"{file_name}_max.png")
         diff_fname = os.path.join(image_fpath, f"{file_name}_diff.png")
+        evolution_fname = os.path.join(image_fpath, f"{file_name}_evolution.png")
         base_fname = os.path.join(image_fpath, f"{file_name}_base.png")
 
         os.makedirs(image_fpath, exist_ok=True)
@@ -148,6 +149,18 @@ def generate_samples(fkd_args, pipeline, prompt_data):
             fkd_args=fkd_diff_args,
         )[0]
         generate_and_save_image(images_fkd_diff, diff_fname, num_particles)
+
+        seed_everything(0 + prompt_idx)
+        fkd_evolution_args = deepcopy(fkd_args)
+        fkd_evolution_args["potential_type"] = "evolution"
+        print(f"Generating samples for {fkd_evolution_args}")
+        images_fkd_evolution = pipeline(
+            prompt,
+            num_inference_steps=fkd_args["time_steps"],
+            eta=args.eta,
+            fkd_args=fkd_evolution_args,
+        )[0]
+        generate_and_save_image(images_fkd_evolution, evolution_fname, num_particles)
 
         seed_everything(0 + prompt_idx)
         base_args = deepcopy(fkd_args)

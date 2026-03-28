@@ -273,7 +273,12 @@ def get_args():
     parser.add_argument("--resample_frequency", type=int, default=5)
     parser.add_argument("--resample_t_start", type=int, default=5)
     parser.add_argument("--resample_t_end", type=int, default=30)
-    parser.add_argument("--potential_type", type=str, default="diff")
+    parser.add_argument(
+        "--potential_type",
+        type=str,
+        default="diff",
+        choices=["diff", "max", "add", "rt", "evolution"],
+    )
 
     args = parser.parse_args()
     print(args.adaptive_resampling)
