@@ -16,6 +16,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import importlib
 import os
@@ -261,8 +262,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--time-steps", type=int, default=50)
     p.add_argument("--lmbda", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=7)
+    p.add_argument(
+        "--seeds",
+        default=None,
+        help="Comma-separated seeds for sweep, e.g. 1,2,3,4,5",
+    )
 
     p.add_argument("--svgd-step-size", type=float, default=0.12)
+    p.add_argument(
+        "--svgd-step-sizes",
+        default=None,
+        help="Comma-separated evo step sizes for sweep, e.g. 0.03,0.06,0.1,0.15",
+    )
     p.add_argument("--svgd-sigma", type=float, default=None)
     p.add_argument("--guidance-reward-fn", default="ImageReward")
     p.add_argument(
@@ -282,6 +293,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--auto-fix-deps", action="store_true")
 
     return p.parse_args()
+
+
+def _parse_int_csv(raw: str | None, *, fallback: int) -> List[int]:
+    if not raw:
+        return [fallback]
+    vals = [v.strip() for v in raw.split(",") if v.strip()]
+    if not vals:
+        return [fallback]
+    return [int(v) for v in vals]
+
+
+def _parse_float_csv(raw: str | None, *, fallback: float) -> List[float]:
+    if not raw:
+        return [fallback]
+    vals = [v.strip() for v in raw.split(",") if v.strip()]
+    if not vals:
+        return [fallback]
+    return [float(v) for v in vals]
 
 
 def resolve_guidance_reward_fn(*, reward_fn: str, fallback_reward_fn: str, allow_fallback: bool) -> str:
@@ -363,47 +392,136 @@ def main() -> None:
     print(f"  device         = {device}")
     print(f"  output_dir     = {output_dir}")
 
+    seeds = _parse_int_csv(args.seeds, fallback=args.seed)
+    svgd_step_sizes = _parse_float_csv(args.svgd_step_sizes, fallback=args.svgd_step_size)
+    print(f"  seeds          = {seeds}")
+    print(f"  svgd_step_sizes= {svgd_step_sizes}")
+
     pipe = get_model(args.model_name).to(device)
 
-    all_scores: Dict[str, Dict] = {}
-    for mode in modes:
-        print(f"\nRunning mode: {mode}")
-        images, rewards, fkd_args = run_mode(
-            pipe=pipe,
-            do_eval=do_eval,
-            prompt=args.prompt,
-            mode=mode,
-            seed=args.seed,
-            num_particles=args.num_particles,
-            time_steps=args.time_steps,
-            lmbda=args.lmbda,
-            svgd_step_size=args.svgd_step_size,
-            svgd_sigma=args.svgd_sigma,
-            guidance_reward_fn=args.guidance_reward_fn,
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows: List[Dict] = []
+
+    for svgd_step_size in svgd_step_sizes:
+        for seed in seeds:
+            print(f"\n=== Sweep run: seed={seed}, svgd_step_size={svgd_step_size} ===")
+            for mode in modes:
+                print(f"Running mode: {mode}")
+                images, rewards, fkd_args = run_mode(
+                    pipe=pipe,
+                    do_eval=do_eval,
+                    prompt=args.prompt,
+                    mode=mode,
+                    seed=seed,
+                    num_particles=args.num_particles,
+                    time_steps=args.time_steps,
+                    lmbda=args.lmbda,
+                    svgd_step_size=svgd_step_size,
+                    svgd_sigma=args.svgd_sigma,
+                    guidance_reward_fn=args.guidance_reward_fn,
+                )
+
+                out_path = output_dir / f"{mode}_seed{seed}_step{svgd_step_size:.4f}.png"
+                show_or_save_images(
+                    images=images,
+                    rewards=rewards,
+                    title=(
+                        f"{args.model_name} | mode={mode} | seed={seed} | "
+                        f"svgd_step_size={svgd_step_size}"
+                    ),
+                    out_path=out_path,
+                    show=args.show,
+                )
+
+                rows.append(
+                    {
+                        "mode": mode,
+                        "seed": seed,
+                        "svgd_step_size": svgd_step_size,
+                        "mean": float(rewards.mean()),
+                        "std": float(rewards.std()),
+                        "best": float(rewards.max()),
+                        "lmbda": args.lmbda,
+                        "num_particles": args.num_particles,
+                        "time_steps": args.time_steps,
+                        "reward_fn": args.guidance_reward_fn,
+                        "fkd_args": str(fkd_args),
+                    }
+                )
+
+    detail_csv = output_dir / "scores_detail.csv"
+    with detail_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "mode",
+                "seed",
+                "svgd_step_size",
+                "mean",
+                "std",
+                "best",
+                "lmbda",
+                "num_particles",
+                "time_steps",
+                "reward_fn",
+                "fkd_args",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    grouped: Dict[Tuple[str, float], List[Dict]] = {}
+    for row in rows:
+        key = (row["mode"], float(row["svgd_step_size"]))
+        grouped.setdefault(key, []).append(row)
+
+    summary_rows: List[Dict] = []
+    for (mode, step), vals in grouped.items():
+        means = np.array([v["mean"] for v in vals], dtype=np.float32)
+        bests = np.array([v["best"] for v in vals], dtype=np.float32)
+        summary_rows.append(
+            {
+                "mode": mode,
+                "svgd_step_size": step,
+                "n_seeds": len(vals),
+                "mean_of_mean": float(means.mean()),
+                "std_of_mean": float(means.std()),
+                "mean_of_best": float(bests.mean()),
+            }
         )
 
-        out_path = output_dir / f"{mode}.png"
-        show_or_save_images(
-            images=images,
-            rewards=rewards,
-            title=f"{args.model_name} | mode={mode} | prompt={args.prompt}",
-            out_path=out_path,
-            show=args.show,
+    summary_rows.sort(key=lambda r: r["mean_of_mean"], reverse=True)
+
+    summary_csv = output_dir / "scores_summary.csv"
+    with summary_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "mode",
+                "svgd_step_size",
+                "n_seeds",
+                "mean_of_mean",
+                "std_of_mean",
+                "mean_of_best",
+            ],
         )
+        writer.writeheader()
+        writer.writerows(summary_rows)
 
-        all_scores[mode] = {
-            "mean": float(rewards.mean()),
-            "std": float(rewards.std()),
-            "best": float(rewards.max()),
-            "args": fkd_args,
-        }
-
-    print(f"\n{args.guidance_reward_fn} summary:")
-    for mode in modes:
-        s = all_scores[mode]
+    print(f"\n{args.guidance_reward_fn} sweep summary (sorted by mean_of_mean):")
+    for row in summary_rows:
         print(
-            f"  {mode:10s} mean={s['mean']:.4f} std={s['std']:.4f} best={s['best']:.4f}"
+            "  "
+            f"mode={row['mode']:10s} "
+            f"step={row['svgd_step_size']:.4f} "
+            f"n={row['n_seeds']} "
+            f"mean={row['mean_of_mean']:.4f} "
+            f"std={row['std_of_mean']:.4f} "
+            f"best_mean={row['mean_of_best']:.4f}"
         )
+
+    print(f"\nSaved detail CSV: {detail_csv}")
+    print(f"Saved summary CSV: {summary_csv}")
 
 
 if __name__ == "__main__":
