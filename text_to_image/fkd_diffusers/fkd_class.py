@@ -74,9 +74,15 @@ def _rbf_kernel(x: torch.Tensor, y: torch.Tensor, sigma: float = 1.0) -> torch.T
     Returns:
         Kernel matrix of shape (n, m)
     """
-    # Compute pairwise squared distances
-    sq_dist = torch.cdist(x, y, p=2.0) ** 2
-    return torch.exp(-sq_dist / (2 * sigma ** 2))
+    # torch.cdist on some CUDA builds does not support float16/bfloat16.
+    # Compute distances in float32 for stability, then cast back.
+    out_dtype = x.dtype
+    x_cdist = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
+    y_cdist = y.float() if y.dtype in (torch.float16, torch.bfloat16) else y
+
+    sq_dist = torch.cdist(x_cdist, y_cdist, p=2.0) ** 2
+    kernel = torch.exp(-sq_dist / (2 * sigma ** 2))
+    return kernel.to(dtype=out_dtype)
 
 
 def _median_pairwise_distance(x: torch.Tensor) -> float:
@@ -90,8 +96,9 @@ def _median_pairwise_distance(x: torch.Tensor) -> float:
     Returns:
         Bandwidth parameter sigma
     """
-    # Compute pairwise distances
-    sq_dist = torch.cdist(x, x, p=2.0) ** 2
+    # torch.cdist on some CUDA builds does not support float16/bfloat16.
+    x_cdist = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
+    sq_dist = torch.cdist(x_cdist, x_cdist, p=2.0) ** 2
     # Get upper triangular part (excluding diagonal)
     distances = torch.triu(sq_dist, diagonal=1)
     # Remove zero entries and compute median

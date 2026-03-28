@@ -28,9 +28,17 @@ from typing import Dict, List, Sequence, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from PIL import Image
 
 
 VALID_MODES = {"base", "diff", "max", "evolution"}
+VALID_REWARD_FNS = {
+    "ImageReward",
+    "Clip-Score",
+    "Clip-Score-only",
+    "HumanPreference",
+    "LLMGrader",
+}
 
 
 def _version(mod_name: str) -> str | None:
@@ -257,6 +265,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--svgd-step-size", type=float, default=0.12)
     p.add_argument("--svgd-sigma", type=float, default=None)
     p.add_argument("--guidance-reward-fn", default="ImageReward")
+    p.add_argument(
+        "--fallback-reward-fn",
+        default="Clip-Score",
+        help="Fallback reward function when primary reward backend is unavailable.",
+    )
+    p.add_argument(
+        "--disable-reward-fallback",
+        action="store_true",
+        help="Disable automatic fallback when guidance reward backend fails.",
+    )
 
     p.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     p.add_argument("--output-dir", default=None)
@@ -264,6 +282,40 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--auto-fix-deps", action="store_true")
 
     return p.parse_args()
+
+
+def resolve_guidance_reward_fn(*, reward_fn: str, fallback_reward_fn: str, allow_fallback: bool) -> str:
+    """Preflight-check reward backend and optionally fallback.
+
+    This specifically protects against ImageReward import crashes from broken
+    wandb/protobuf stacks in managed notebook runtimes.
+    """
+    if reward_fn not in VALID_REWARD_FNS:
+        raise ValueError(f"Unknown guidance reward fn: {reward_fn}")
+    if fallback_reward_fn not in VALID_REWARD_FNS:
+        raise ValueError(f"Unknown fallback reward fn: {fallback_reward_fn}")
+
+    if reward_fn != "ImageReward":
+        return reward_fn
+
+    try:
+        from fkd_diffusers.rewards import do_image_reward
+
+        # Tiny smoke test to trigger backend import early.
+        _ = do_image_reward(images=[Image.new("RGB", (224, 224))], prompts=["test"])
+        return reward_fn
+    except Exception as exc:
+        if not allow_fallback:
+            raise RuntimeError(
+                "ImageReward backend is unavailable and reward fallback is disabled."
+            ) from exc
+
+        print(
+            "Warning: ImageReward backend failed to initialize. "
+            f"Falling back to {fallback_reward_fn}."
+        )
+        print(f"Reason: {exc}")
+        return fallback_reward_fn
 
 
 def main() -> None:
@@ -284,6 +336,12 @@ def main() -> None:
     sys.path.insert(0, str(fkd_diffusers_root))
 
     from fks_utils import do_eval, get_model
+
+    args.guidance_reward_fn = resolve_guidance_reward_fn(
+        reward_fn=args.guidance_reward_fn,
+        fallback_reward_fn=args.fallback_reward_fn,
+        allow_fallback=not args.disable_reward_fallback,
+    )
 
     if args.device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
