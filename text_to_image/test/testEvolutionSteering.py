@@ -43,16 +43,17 @@ def test_evolution_steering():
     x0_preds = torch.randn(4, 3, 64, 64)
 
     # Perform resampling
-    resampled_latents, steered_x0_preds = fkd.resample(
+    resampled_latents, resampled_images = fkd.resample(
         sampling_idx=5, latents=latents, x0_preds=x0_preds
     )
 
     # Assert resampled latents shape
     assert resampled_latents.shape == latents.shape, "Resampled latents shape mismatch"
     
-    # For evolution steering, steered_x0_preds should be returned and have same shape
-    assert steered_x0_preds is not None, "SVGD steering should return steered x0_preds"
-    assert steered_x0_preds.shape == x0_preds.shape, "Steered x0_preds shape mismatch"
+    # For evolution steering, optional images may be returned by decoder path.
+    # In this unit test latent_to_decode_fn is identity, so output shape should match.
+    assert resampled_images is not None, "Evolution steering should return decoded/resampled images"
+    assert resampled_images.shape == x0_preds.shape, "Resampled image tensor shape mismatch"
 
     # Test binary rewards
     rewards = [0.2, 0.8, 0.5, 0.9]
@@ -147,6 +148,59 @@ def test_svgd_vector_field():
     print("SVGD vector field test passed.")
 
 
+def test_svgd_vector_field_mixture_score():
+    """
+    Test score-based SVGD path using q(x_t | x0) mixture approximation.
+    """
+    device = torch.device("cpu")
+    num_particles = 10
+    dim = 4
+
+    # Construct two clusters in x0 space: bad near 0, good near +4.
+    bad_x0 = torch.randn(num_particles // 2, dim) * 0.2
+    good_x0 = torch.randn(num_particles // 2, dim) * 0.2 + 4.0
+    x0_particles = torch.cat([bad_x0, good_x0], dim=0)
+
+    # Build x_t by forward noising from corresponding x0.
+    alpha_bar_t = 0.7
+    noise_scale = np.sqrt(max(1.0 - alpha_bar_t, 1e-6))
+    xt_particles = np.sqrt(alpha_bar_t) * x0_particles + noise_scale * torch.randn_like(x0_particles)
+
+    binary_rewards = [0] * (num_particles // 2) + [1] * (num_particles // 2)
+
+    field = compute_svgd_vector_field(
+        particles=xt_particles,
+        binary_rewards=binary_rewards,
+        x0_particles=x0_particles,
+        alpha_bar_t=alpha_bar_t,
+        sigma=None,
+        device=device,
+    )
+
+    assert field.shape == xt_particles.shape, "Mixture-score field shape mismatch"
+
+    steered = apply_svgd_steering(
+        particles=xt_particles,
+        binary_rewards=binary_rewards,
+        x0_particles=x0_particles,
+        alpha_bar_t=alpha_bar_t,
+        step_size=0.1,
+        sigma=None,
+        device=device,
+    )
+    assert steered.shape == xt_particles.shape, "Mixture-score steering shape mismatch"
+
+    # Bad particles should become closer to good x_t center on average.
+    good_center = xt_particles[num_particles // 2:].mean(dim=0)
+    bad_before = xt_particles[: num_particles // 2]
+    bad_after = steered[: num_particles // 2]
+    dist_before = torch.norm(bad_before - good_center, dim=1).mean()
+    dist_after = torch.norm(bad_after - good_center, dim=1).mean()
+    assert dist_after <= dist_before + 1e-5, "Mixture-score SVGD should move bad particles toward good region"
+
+    print("SVGD mixture-score test passed.")
+
+
 def test_apply_svgd_steering():
     """
     Test SVGD steering application to particles.
@@ -205,6 +259,9 @@ if __name__ == "__main__":
     
     test_svgd_vector_field()
     print("✓ SVGD vector field test passed.")
+
+    test_svgd_vector_field_mixture_score()
+    print("✓ SVGD mixture-score test passed.")
     
     test_apply_svgd_steering()
     print("✓ SVGD steering test passed.")

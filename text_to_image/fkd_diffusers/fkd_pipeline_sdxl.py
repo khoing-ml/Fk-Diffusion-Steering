@@ -696,11 +696,28 @@ class FKDStableDiffusionXL(
 
         print('Args:', fkd_args)
         if fkd_args is not None and fkd_args['use_smc']:
+            def _alpha_bar_from_sampling_idx(step_idx: int) -> Optional[float]:
+                if not hasattr(self.scheduler, "alphas_cumprod"):
+                    return None
+                if step_idx < 0 or step_idx >= len(timesteps):
+                    return None
+                t_train = timesteps[step_idx]
+                if isinstance(t_train, torch.Tensor):
+                    t_train = int(t_train.item())
+                else:
+                    t_train = int(t_train)
+                alphas_cumprod = self.scheduler.alphas_cumprod
+                if isinstance(alphas_cumprod, torch.Tensor):
+                    idx = max(0, min(t_train, alphas_cumprod.shape[0] - 1))
+                    return float(alphas_cumprod[idx].detach().cpu().item())
+                return None
+
             fkd = FKD(
                 latent_to_decode_fn=lambda x: latent_to_decode(
                     model=self, output_type=output_type, latents=x
                 ),
                 reward_fn=postprocess_and_apply_reward_fn,
+                alpha_bar_fn=_alpha_bar_from_sampling_idx,
                 **fkd_args,
             )
 
