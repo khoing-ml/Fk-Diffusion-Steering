@@ -190,7 +190,12 @@ class FKDStableDiffusion(
     model_cpu_offload_seq = "text_encoder->image_encoder->unet->vae"
     _optional_components = ["safety_checker", "feature_extractor", "image_encoder"]
     _exclude_from_cpu_offload = ["safety_checker"]
-    _callback_tensor_inputs = ["latents", "prompt_embeds", "negative_prompt_embeds"]
+    _callback_tensor_inputs = [
+        "latents",
+        "prompt_embeds",
+        "negative_prompt_embeds",
+        "particle_previews",
+    ]
 
     def __init__(
         self,
@@ -566,12 +571,21 @@ class FKDStableDiffusion(
                 x0_preds = step_dict["pred_original_sample"]
 
                 # FK Steering Change
+                current_pop_images = None
                 if fkd_args is not None and fkd_args["use_smc"]:
-                    latents, _ = fkd.resample(
+                    latents, current_pop_images = fkd.resample(
                         sampling_idx=i, latents=latents, x0_preds=x0_preds
                     )
 
                 if callback_on_step_end is not None:
+                    particle_previews = None
+                    if "particle_previews" in callback_on_step_end_tensor_inputs:
+                        particle_previews = current_pop_images
+                        if particle_previews is None:
+                            particle_previews = latent_to_decode(
+                                model=self, output_type=output_type, latents=x0_preds
+                            )
+
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
                         callback_kwargs[k] = locals()[k]

@@ -239,6 +239,7 @@ class FKDStableDiffusionXL(
         "add_time_ids",
         "negative_pooled_prompt_embeds",
         "negative_add_time_ids",
+        "particle_previews",
     ]
 
     def __init__(
@@ -788,6 +789,7 @@ class FKDStableDiffusionXL(
                 x0_preds = step_dict['pred_original_sample']
 
                 # FK Steering Change
+                current_pop_images = None
                 if fkd_args is not None and fkd_args['use_smc']:
                     latents, current_pop_images = fkd.resample(
                         sampling_idx=i, latents=latents, x0_preds=x0_preds
@@ -806,6 +808,14 @@ class FKDStableDiffusionXL(
                         latents = latents.to(latents_dtype)
 
                 if callback_on_step_end is not None:
+                    particle_previews = None
+                    if "particle_previews" in callback_on_step_end_tensor_inputs:
+                        particle_previews = current_pop_images
+                        if particle_previews is None:
+                            particle_previews = latent_to_decode(
+                                model=self, output_type=output_type, latents=x0_preds
+                            )
+
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
                         callback_kwargs[k] = locals()[k]

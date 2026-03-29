@@ -136,7 +136,7 @@ def build_fkd_args(
         "adaptive_resampling": True,
         "resample_frequency": 10,
         "resampling_t_start": 10,
-        "resampling_t_end": max(10, time_steps - 5),
+        "resampling_t_end": max(10, 30),
         "time_steps": time_steps,
         "num_particles": num_particles,
         "guidance_reward_fn": guidance_reward_fn,
