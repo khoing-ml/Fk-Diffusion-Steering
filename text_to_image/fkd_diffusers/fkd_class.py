@@ -484,6 +484,8 @@ class FKD:
         device: Device on which computations will be performed (default: CUDA).
         svgd_step_size: Step size for SVGD vector field application in evolution steering (default: 0.1).
         svgd_sigma: Bandwidth for SVGD RBF kernel. If None, uses median pairwise distance.
+        guidance_frequency: Frequency (in timesteps) for applying SVGD guidance in evolution mode.
+            If None, defaults to `resample_frequency` to preserve the previous behavior.
         resample_strategy: Resampling strategy used when resampling is enabled.
             Supported: multinomial, systematic, stratified, residual, none.
         alpha_bar_fn: Optional callback mapping sampling index -> alpha_bar_t for score-based SVGD.
@@ -507,6 +509,7 @@ class FKD:
         device: torch.device = torch.device('cuda'),
         svgd_step_size: float = 0.1,
         svgd_sigma: Optional[float] = None,
+        guidance_frequency: Optional[int] = None,
         resample_strategy: str = "multinomial",
         alpha_bar_fn: Optional[Callable[[int], Optional[float]]] = None,
         **kwargs,
@@ -531,6 +534,11 @@ class FKD:
         # SVGD parameters
         self.svgd_step_size = svgd_step_size
         self.svgd_sigma = svgd_sigma
+        self.guidance_frequency = (
+            self.resample_frequency if guidance_frequency is None else int(guidance_frequency)
+        )
+        if self.guidance_frequency <= 0:
+            raise ValueError("guidance_frequency must be a positive integer.")
         self.resample_strategy = str(resample_strategy).lower()
         if self.resample_strategy not in VALID_RESAMPLE_STRATEGIES:
             raise ValueError(
@@ -564,21 +572,25 @@ class FKD:
         Returns:
             A tuple containing updated latents and optionally decoded images.
         """
-        # Check if resampling is within the allowed range and conditions
-        resampling_interval = np.arange(
-            self.resampling_t_start, self.resampling_t_end + 1, self.resample_frequency
-        )
-
-        if sampling_idx not in resampling_interval:
-            return latents, None
-
-        # Evolution steering should score the predicted clean sample x0.
-        decoded_images = self.latent_to_decode_fn(x0_preds)
-
-        # Compute rewards using the existing reward function
-        rewards = self.reward_fn(decoded_images)
-
         if self.potential_type == PotentialType.EVOLUTION:
+            resampling_interval = np.arange(
+                self.resampling_t_start, self.resampling_t_end + 1, self.resample_frequency
+            )
+            guidance_interval = np.arange(
+                self.resampling_t_start, self.resampling_t_end + 1, self.guidance_frequency
+            )
+            should_resample = (
+                self.resample_strategy != "none" and sampling_idx in resampling_interval
+            )
+            should_guide = sampling_idx in guidance_interval
+
+            if not should_resample and not should_guide:
+                return latents, None
+
+            # Evolution steering scores the predicted clean sample x0 and can
+            # use the same rewards for both selection and SVGD transport.
+            decoded_images = self.latent_to_decode_fn(x0_preds)
+            rewards = self.reward_fn(decoded_images)
             binary_rewards = evolution_steering_binary_rewards(rewards=rewards)
             good_indices = [i for i, y in enumerate(binary_rewards) if y == 1]
             good_anchor_x0 = (
@@ -587,7 +599,7 @@ class FKD:
                 else None
             )
 
-            if self.resample_strategy != "none":
+            if should_resample:
                 resampling_weights = _safe_resampling_weights(
                     binary_rewards,
                     device=latents.device,
@@ -605,6 +617,9 @@ class FKD:
                     else None
                 )
                 binary_rewards = [binary_rewards[i] for i in resampled_indices.tolist()]
+
+            if not should_guide:
+                return latents, decoded_images
 
             alpha_bar_t = None
             if self.alpha_bar_fn is not None:
@@ -624,6 +639,17 @@ class FKD:
             return steered_latents, decoded_images
             
         else:
+            # Check if resampling is within the allowed range and conditions
+            resampling_interval = np.arange(
+                self.resampling_t_start, self.resampling_t_end + 1, self.resample_frequency
+            )
+
+            if sampling_idx not in resampling_interval:
+                return latents, None
+
+            decoded_images = self.latent_to_decode_fn(x0_preds)
+            rewards = self.reward_fn(decoded_images)
+
             if self.resample_strategy == "none":
                 return latents, decoded_images
 

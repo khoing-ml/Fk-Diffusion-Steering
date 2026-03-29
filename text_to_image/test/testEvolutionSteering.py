@@ -63,6 +63,44 @@ def test_evolution_steering():
     assert binary_rewards == [0, 1, 0, 1], "Binary rewards mismatch"
 
 
+def test_evolution_guidance_frequency():
+    """
+    Evolution mode should only apply SVGD on the configured guidance cadence.
+    """
+    def mock_reward_fn(images):
+        return torch.tensor([0.2, 0.8, 0.5, 0.9])
+
+    fkd = FKD(
+        potential_type=PotentialType.EVOLUTION,
+        lmbda=1.0,
+        num_particles=4,
+        adaptive_resampling=False,
+        resample_frequency=1,
+        resampling_t_start=0,
+        resampling_t_end=10,
+        time_steps=10,
+        reward_fn=mock_reward_fn,
+        guidance_frequency=3,
+        resample_strategy="none",
+        device=torch.device("cpu"),
+    )
+
+    latents = torch.randn(4, 3, 16, 16)
+    x0_preds = torch.randn(4, 3, 16, 16)
+
+    skipped_latents, skipped_images = fkd.resample(
+        sampling_idx=1, latents=latents.clone(), x0_preds=x0_preds.clone()
+    )
+    assert torch.allclose(skipped_latents, latents), "Latents should be unchanged off guidance cadence"
+    assert skipped_images is None, "No decoded images should be produced when evolution update is skipped"
+
+    guided_latents, guided_images = fkd.resample(
+        sampling_idx=3, latents=latents.clone(), x0_preds=x0_preds.clone()
+    )
+    assert not torch.allclose(guided_latents, latents), "Latents should change on guidance cadence"
+    assert guided_images is not None, "Decoded images should be returned when guidance runs"
+
+
 def test_rbf_kernel():
     """
     Test RBF kernel computation.

@@ -128,6 +128,7 @@ def build_fkd_args(
     guidance_reward_fn: str,
     svgd_step_size: float,
     svgd_sigma: float | None,
+    guidance_frequency: int | None,
     resample_strategy: str,
 ) -> Dict:
     args = {
@@ -136,7 +137,7 @@ def build_fkd_args(
         "adaptive_resampling": True,
         "resample_frequency": 10,
         "resampling_t_start": 10,
-        "resampling_t_end": max(10, 30),
+        "resampling_t_end": max(10, time_steps - 10),
         "time_steps": time_steps,
         "num_particles": num_particles,
         "guidance_reward_fn": guidance_reward_fn,
@@ -148,8 +149,14 @@ def build_fkd_args(
         args["potential_type"] = potential_type
 
     if potential_type == "evolution":
+        effective_guidance_frequency = (
+            args["resample_frequency"]
+            if guidance_frequency is None
+            else guidance_frequency
+        )
         args["svgd_step_size"] = svgd_step_size
         args["svgd_sigma"] = svgd_sigma
+        args["guidance_frequency"] = effective_guidance_frequency
 
     return args
 
@@ -198,6 +205,7 @@ def run_mode(
     lmbda: float,
     svgd_step_size: float,
     svgd_sigma: float | None,
+    guidance_frequency: int | None,
     guidance_reward_fn: str,
     resample_strategy: str,
     evolution_resample_strategy: str,
@@ -221,6 +229,7 @@ def run_mode(
             guidance_reward_fn=guidance_reward_fn,
             svgd_step_size=svgd_step_size,
             svgd_sigma=svgd_sigma,
+            guidance_frequency=guidance_frequency,
             resample_strategy=effective_resample_strategy,
         )
     else:
@@ -233,6 +242,7 @@ def run_mode(
             guidance_reward_fn=guidance_reward_fn,
             svgd_step_size=svgd_step_size,
             svgd_sigma=svgd_sigma,
+            guidance_frequency=guidance_frequency,
             resample_strategy=effective_resample_strategy,
         )
 
@@ -279,6 +289,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     p.add_argument("--svgd-step-size", type=float, default=0.12)
+    p.add_argument(
+        "--guidance-frequency",
+        type=int,
+        default=None,
+        help=(
+            "Frequency for SVGD guidance in evolution mode. "
+            "If omitted, evolution guidance follows --resample-frequency's effective cadence "
+            "(currently the built-in default of 10 in this script)."
+        ),
+    )
     p.add_argument(
         "--svgd-step-sizes",
         default=None,
@@ -450,6 +470,7 @@ def main() -> None:
         )
     print(f"  seeds          = {seeds}")
     print(f"  svgd_step_sizes= {svgd_step_sizes}")
+    print(f"  guidance_frequency = {args.guidance_frequency}")
     print(f"  resample_strategies = {resample_strategies}")
     print(f"  evolution_resample_strategy = {args.evolution_resample_strategy}")
 
@@ -478,21 +499,27 @@ def main() -> None:
                         lmbda=args.lmbda,
                         svgd_step_size=svgd_step_size,
                         svgd_sigma=args.svgd_sigma,
+                        guidance_frequency=args.guidance_frequency,
                         guidance_reward_fn=args.guidance_reward_fn,
                         resample_strategy=resample_strategy,
                         evolution_resample_strategy=args.evolution_resample_strategy,
                     )
 
                     effective_resample_strategy = fkd_args["resample_strategy"]
+                    guidance_tag = ""
+                    if mode == "evolution":
+                        guidance_value = fkd_args.get("guidance_frequency")
+                        guidance_tag = f"_gfreq{guidance_value}"
                     out_path = output_dir / (
-                        f"{mode}_rs-{effective_resample_strategy}_seed{seed}_step{svgd_step_size:.4f}.png"
+                        f"{mode}_rs-{effective_resample_strategy}{guidance_tag}_seed{seed}_step{svgd_step_size:.4f}.png"
                     )
                     show_or_save_images(
                         images=images,
                         rewards=rewards,
                         title=(
                             f"{args.model_name} | mode={mode} | rs={effective_resample_strategy} | "
-                            f"seed={seed} | svgd_step_size={svgd_step_size}"
+                            f"seed={seed} | svgd_step_size={svgd_step_size} | "
+                            f"guidance_frequency={fkd_args.get('guidance_frequency')}"
                         ),
                         out_path=out_path,
                         show=args.show,
@@ -504,6 +531,7 @@ def main() -> None:
                             "resample_strategy": effective_resample_strategy,
                             "seed": seed,
                             "svgd_step_size": svgd_step_size,
+                            "guidance_frequency": fkd_args.get("guidance_frequency"),
                             "mean": float(rewards.mean()),
                             "std": float(rewards.std()),
                             "best": float(rewards.max()),
@@ -524,6 +552,7 @@ def main() -> None:
                 "resample_strategy",
                 "seed",
                 "svgd_step_size",
+                "guidance_frequency",
                 "mean",
                 "std",
                 "best",
@@ -537,17 +566,18 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    grouped: Dict[Tuple[str, float], List[Dict]] = {}
+    grouped: Dict[Tuple[str, str, float, int | None], List[Dict]] = {}
     for row in rows:
         key = (
             row["mode"],
             row["resample_strategy"],
             float(row["svgd_step_size"]),
+            row["guidance_frequency"],
         )
         grouped.setdefault(key, []).append(row)
 
     summary_rows: List[Dict] = []
-    for (mode, resample_strategy, step), vals in grouped.items():
+    for (mode, resample_strategy, step, guidance_frequency), vals in grouped.items():
         means = np.array([v["mean"] for v in vals], dtype=np.float32)
         bests = np.array([v["best"] for v in vals], dtype=np.float32)
         summary_rows.append(
@@ -555,6 +585,7 @@ def main() -> None:
                 "mode": mode,
                 "resample_strategy": resample_strategy,
                 "svgd_step_size": step,
+                "guidance_frequency": guidance_frequency,
                 "n_seeds": len(vals),
                 "mean_of_mean": float(means.mean()),
                 "std_of_mean": float(means.std()),
@@ -572,6 +603,7 @@ def main() -> None:
                 "mode",
                 "resample_strategy",
                 "svgd_step_size",
+                "guidance_frequency",
                 "n_seeds",
                 "mean_of_mean",
                 "std_of_mean",
@@ -588,6 +620,7 @@ def main() -> None:
             f"mode={row['mode']:10s} "
             f"rs={row['resample_strategy']:11s} "
             f"step={row['svgd_step_size']:.4f} "
+            f"gfreq={row['guidance_frequency']} "
             f"n={row['n_seeds']} "
             f"mean={row['mean_of_mean']:.4f} "
             f"std={row['std_of_mean']:.4f} "
