@@ -19,7 +19,7 @@ $$
 $$
 \begin{aligned}
 &\textbf{Input: } \text{Diffusion model } p_\theta(\mathbf{x}_{0:T}\mid \mathbf{c}),\ \text{reward } r(\mathbf{x}_0,\mathbf{c}), \\
-&\quad \text{proposals } \tau(\mathbf{x}_t \mid \mathbf{x}_{t+1}, \mathbf{c}),\ \text{potentials } G_t, \\
+&\quad \text{proposals } \tau(\mathbf{x}_t \mid \mathbf{x}_{t+2}, \mathbf{c}),\ \text{potentials } G_t, \\
 &\quad \text{intermediate rewards } r_\phi(\mathbf{x}_t,\mathbf{c}),\ \text{number of particles } K. \\[1em]
 
 &\textbf{Sample } \mathbf{x}_T^i \sim \tau(\mathbf{x}_T \mid \mathbf{c}) \text{ for } i \in [K] \\

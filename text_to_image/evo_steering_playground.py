@@ -143,6 +143,8 @@ def build_fkd_args(
     potential_type: str,
     num_particles: int,
     time_steps: int,
+    update_t_start: int,
+    update_t_end: int,
     lmbda: float,
     use_smc: bool,
     guidance_reward_fn: str,
@@ -164,8 +166,8 @@ def build_fkd_args(
         "use_smc": use_smc,
         "adaptive_resampling": True,
         "resample_frequency": 10,
-        "resampling_t_start": 10,
-        "resampling_t_end": max(10, time_steps - 10),
+        "resampling_t_start": update_t_start,
+        "resampling_t_end": update_t_end,
         "time_steps": time_steps,
         "num_particles": num_particles,
         "guidance_reward_fn": guidance_reward_fn,
@@ -195,6 +197,42 @@ def build_fkd_args(
         args["bad_guidance_strength"] = bad_guidance_strength
 
     return args
+
+
+def build_evo_args(
+    *,
+    num_particles: int,
+    update_t_start: int,
+    update_t_end: int,
+    guidance_reward_fn: str,
+    step_size: float,
+    sigma: float | None,
+    guidance_frequency: int | None,
+    archive_size: int,
+    archive_good_quantile: float,
+    archive_bad_quantile: float,
+    archive_burn_in_steps: int,
+    min_good_anchors: int,
+    min_bad_anchors: int,
+    bad_guidance_strength: float,
+) -> Dict:
+    effective_guidance_frequency = 10 if guidance_frequency is None else guidance_frequency
+    return {
+        "num_particles": num_particles,
+        "update_t_start": update_t_start,
+        "update_t_end": update_t_end,
+        "guidance_reward_fn": guidance_reward_fn,
+        "step_size": step_size,
+        "sigma": sigma,
+        "guidance_frequency": effective_guidance_frequency,
+        "archive_size": archive_size,
+        "archive_good_quantile": archive_good_quantile,
+        "archive_bad_quantile": archive_bad_quantile,
+        "archive_burn_in_steps": archive_burn_in_steps,
+        "min_good_anchors": min_good_anchors,
+        "min_bad_anchors": min_bad_anchors,
+        "bad_guidance_strength": bad_guidance_strength,
+    }
 
 
 def show_or_save_images(
@@ -239,6 +277,8 @@ def run_mode(
     seed: int,
     num_particles: int,
     time_steps: int,
+    update_t_start: int,
+    update_t_end: int,
     lmbda: float,
     svgd_step_size: float,
     svgd_sigma: float | None,
@@ -265,11 +305,31 @@ def run_mode(
         evolution_resample_strategy if mode == "evolution" else resample_strategy
     )
 
-    if mode == "base":
+    if mode == "evolution":
+        steering_args = build_evo_args(
+            num_particles=num_particles,
+            update_t_start=update_t_start,
+            update_t_end=update_t_end,
+            guidance_reward_fn=guidance_reward_fn,
+            step_size=svgd_step_size,
+            sigma=svgd_sigma,
+            guidance_frequency=guidance_frequency,
+            archive_size=archive_size,
+            archive_good_quantile=archive_good_quantile,
+            archive_bad_quantile=archive_bad_quantile,
+            archive_burn_in_steps=archive_burn_in_steps,
+            min_good_anchors=min_good_anchors,
+            min_bad_anchors=min_bad_anchors,
+            bad_guidance_strength=bad_guidance_strength,
+        )
+        pipe_kwargs = {"evo_args": steering_args}
+    elif mode == "base":
         fkd_args = build_fkd_args(
             potential_type="diff",
             num_particles=num_particles,
             time_steps=time_steps,
+            update_t_start=update_t_start,
+            update_t_end=update_t_end,
             lmbda=lmbda,
             use_smc=False,
             guidance_reward_fn=guidance_reward_fn,
@@ -286,11 +346,15 @@ def run_mode(
             bad_guidance_strength=bad_guidance_strength,
             resample_strategy=effective_resample_strategy,
         )
+        steering_args = fkd_args
+        pipe_kwargs = {"fkd_args": steering_args}
     else:
         fkd_args = build_fkd_args(
             potential_type=mode,
             num_particles=num_particles,
             time_steps=time_steps,
+            update_t_start=update_t_start,
+            update_t_end=update_t_end,
             lmbda=lmbda,
             use_smc=True,
             guidance_reward_fn=guidance_reward_fn,
@@ -307,13 +371,15 @@ def run_mode(
             bad_guidance_strength=bad_guidance_strength,
             resample_strategy=effective_resample_strategy,
         )
+        steering_args = fkd_args
+        pipe_kwargs = {"fkd_args": steering_args}
 
     prompts = [prompt] * num_particles
     images = pipe(
         prompts,
         num_inference_steps=time_steps,
         eta=1.0,
-        fkd_args=fkd_args,
+        **pipe_kwargs,
     )[0]
 
     metric_name = guidance_reward_fn
@@ -327,7 +393,7 @@ def run_mode(
     images_sorted = [images[i] for i in order]
     rewards_sorted = rewards[order]
 
-    return images_sorted, rewards_sorted, fkd_args
+    return images_sorted, rewards_sorted, steering_args
 
 
 def parse_args() -> argparse.Namespace:
@@ -342,6 +408,13 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--num-particles", type=int, default=4)
     p.add_argument("--time-steps", type=int, default=50)
+    p.add_argument("--update-t-start", type=int, default=10)
+    p.add_argument(
+        "--update-t-end",
+        type=int,
+        default=None,
+        help="Last timestep index to allow FKD/Evo updates. Defaults to time_steps - 10.",
+    )
     p.add_argument("--lmbda", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=7)
     p.add_argument(
@@ -364,7 +437,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--use-anchor-archive",
         action="store_true",
-        help="Accumulate good/bad x0 anchors before applying evolution guidance.",
+        help=(
+            "Legacy FKD evolution option. The new `evo_diffusers` path is "
+            "archive-based by design, so this flag is ignored there."
+        ),
     )
     p.add_argument(
         "--archive-size",
@@ -425,8 +501,8 @@ def parse_args() -> argparse.Namespace:
         default="none",
         choices=["multinomial", "systematic", "stratified", "residual", "none"],
         help=(
-            "Resampling strategy used only for evolution mode. Defaults to 'none' "
-            "because cloning winners tends to collapse diversity."
+            "Legacy FKD evolution resampling strategy. The new `evo_diffusers` "
+            "module does not resample and keeps this option only for backward compatibility."
         ),
     )
     p.add_argument(
@@ -501,7 +577,7 @@ def resolve_guidance_reward_fn(*, reward_fn: str, fallback_reward_fn: str, allow
 
     try:
         Image = _require_pil_image()
-        from fkd_diffusers.rewards import do_image_reward
+        from evo_diffusers.rewards import do_image_reward
 
         # Tiny smoke test to trigger backend import early.
         _ = do_image_reward(images=[Image.new("RGB", (224, 224))], prompts=["test"])
@@ -544,6 +620,16 @@ def main() -> None:
     if args.bad_guidance_strength < 0:
         raise ValueError("--bad-guidance-strength must be >= 0")
 
+    effective_update_t_end = (
+        max(args.update_t_start, args.time_steps - 10)
+        if args.update_t_end is None
+        else args.update_t_end
+    )
+    if args.update_t_start < 0:
+        raise ValueError("--update-t-start must be >= 0")
+    if effective_update_t_end < args.update_t_start:
+        raise ValueError("--update-t-end must be >= --update-t-start")
+
     ensure_dependency_compat(auto_fix=args.auto_fix_deps)
 
     repo_root, text_to_image_root = resolve_paths()
@@ -578,6 +664,7 @@ def main() -> None:
     print(f"  modes          = {modes}")
     print(f"  device         = {device}")
     print(f"  output_dir     = {output_dir}")
+    print(f"  update_window  = [{args.update_t_start}, {effective_update_t_end}]")
 
     seeds = _parse_int_csv(args.seeds, fallback=args.seed)
     svgd_step_sizes = _parse_float_csv(args.svgd_step_sizes, fallback=args.svgd_step_size)
@@ -606,7 +693,7 @@ def main() -> None:
     print(f"  resample_strategies = {resample_strategies}")
     print(f"  evolution_resample_strategy = {args.evolution_resample_strategy}")
 
-    pipe = get_model(args.model_name).to(device)
+    pipe = get_model(args.model_name, pipeline_family="evo").to(device)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     rows: List[Dict] = []
@@ -620,7 +707,7 @@ def main() -> None:
                 )
                 for mode in modes:
                     print(f"Running mode: {mode}")
-                    images, rewards, fkd_args = run_mode(
+                    images, rewards, steering_args = run_mode(
                         pipe=pipe,
                         do_eval=do_eval,
                         prompt=args.prompt,
@@ -628,6 +715,8 @@ def main() -> None:
                         seed=seed,
                         num_particles=args.num_particles,
                         time_steps=args.time_steps,
+                        update_t_start=args.update_t_start,
+                        update_t_end=effective_update_t_end,
                         lmbda=args.lmbda,
                         svgd_step_size=svgd_step_size,
                         svgd_sigma=args.svgd_sigma,
@@ -645,23 +734,24 @@ def main() -> None:
                         evolution_resample_strategy=args.evolution_resample_strategy,
                     )
 
-                    effective_resample_strategy = fkd_args["resample_strategy"]
+                    effective_resample_strategy = steering_args.get("resample_strategy", "none")
                     guidance_tag = ""
                     if mode == "evolution":
-                        guidance_value = fkd_args.get("guidance_frequency")
-                        archive_tag = "_archive" if fkd_args.get("use_anchor_archive") else ""
+                        guidance_value = steering_args.get("guidance_frequency")
+                        archive_tag = "_archive"
                         guidance_tag = f"_gfreq{guidance_value}{archive_tag}"
                     out_path = output_dir / (
                         f"{mode}_rs-{effective_resample_strategy}{guidance_tag}_seed{seed}_step{svgd_step_size:.4f}.png"
                     )
+                    uses_archive = mode == "evolution" or steering_args.get("use_anchor_archive", False)
                     show_or_save_images(
                         images=images,
                         rewards=rewards,
                         title=(
                             f"{args.model_name} | mode={mode} | rs={effective_resample_strategy} | "
                             f"seed={seed} | svgd_step_size={svgd_step_size} | "
-                            f"guidance_frequency={fkd_args.get('guidance_frequency')} | "
-                            f"archive={fkd_args.get('use_anchor_archive', False)}"
+                            f"guidance_frequency={steering_args.get('guidance_frequency')} | "
+                            f"archive={uses_archive}"
                         ),
                         out_path=out_path,
                         show=args.show,
@@ -673,8 +763,8 @@ def main() -> None:
                             "resample_strategy": effective_resample_strategy,
                             "seed": seed,
                             "svgd_step_size": svgd_step_size,
-                            "guidance_frequency": fkd_args.get("guidance_frequency"),
-                            "use_anchor_archive": fkd_args.get("use_anchor_archive", False),
+                            "guidance_frequency": steering_args.get("guidance_frequency"),
+                            "use_anchor_archive": uses_archive,
                             "mean": float(rewards.mean()),
                             "std": float(rewards.std()),
                             "best": float(rewards.max()),
@@ -682,7 +772,7 @@ def main() -> None:
                             "num_particles": args.num_particles,
                             "time_steps": args.time_steps,
                             "reward_fn": args.guidance_reward_fn,
-                            "fkd_args": str(fkd_args),
+                            "steering_args": str(steering_args),
                         }
                     )
 
@@ -704,7 +794,7 @@ def main() -> None:
                 "num_particles",
                 "time_steps",
                 "reward_fn",
-                "fkd_args",
+                "steering_args",
             ],
         )
         writer.writeheader()

@@ -8,10 +8,18 @@ try:
     # Preferred when `text_to_image` is on sys.path.
     from fkd_diffusers.fkd_pipeline_sdxl import FKDStableDiffusionXL
     from fkd_diffusers.fkd_pipeline_sd import FKDStableDiffusion
+    from evo_diffusers.evo_pipeline_sdxl import EvoStableDiffusionXL
+    from evo_diffusers.evo_pipeline_sd import EvoStableDiffusion
 except ModuleNotFoundError:
     # Backward-compatible fallback for older layouts.
     from fkd_pipeline_sdxl import FKDStableDiffusionXL
     from fkd_pipeline_sd import FKDStableDiffusion
+    try:
+        from evo_diffusers.evo_pipeline_sdxl import EvoStableDiffusionXL
+        from evo_diffusers.evo_pipeline_sd import EvoStableDiffusion
+    except ModuleNotFoundError:
+        from evo_pipeline_sdxl import EvoStableDiffusionXL
+        from evo_pipeline_sd import EvoStableDiffusion
 
 from fkd_diffusers.rewards import (
     do_clip_score,
@@ -22,18 +30,39 @@ from fkd_diffusers.rewards import (
 )
 
 
-def get_model(model_name):
+def get_model(model_name, *, pipeline_family="fkd"):
     """
-    Get the FKD-supported model based on the model name.
+    Get a steering-aware pipeline based on the model name and wrapper family.
     """
+    if pipeline_family == "fkd":
+        sdxl_cls = FKDStableDiffusionXL
+        sd_cls = FKDStableDiffusion
+    elif pipeline_family == "evo":
+        sdxl_cls = EvoStableDiffusionXL
+        sd_cls = EvoStableDiffusion
+    else:
+        raise ValueError(f"Unknown pipeline family: {pipeline_family}")
+
     if model_name == "stable-diffusion-xl":
-        pipeline = FKDStableDiffusionXL.from_pretrained("stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16)
+        pipeline = sdxl_cls.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0",
+            torch_dtype=torch.float16,
+        )
     elif model_name == "stable-diffusion-v1-5":
-        pipeline = FKDStableDiffusion.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16)
+        pipeline = sd_cls.from_pretrained(
+            "runwayml/stable-diffusion-v1-5",
+            torch_dtype=torch.float16,
+        )
     elif model_name == "stable-diffusion-v1-4":
-        pipeline = FKDStableDiffusion.from_pretrained("CompVis/stable-diffusion-v1-4", torch_dtype=torch.float16)
+        pipeline = sd_cls.from_pretrained(
+            "CompVis/stable-diffusion-v1-4",
+            torch_dtype=torch.float16,
+        )
     elif model_name == "stable-diffusion-2-1":
-        pipeline = FKDStableDiffusion.from_pretrained("sd2-community/stable-diffusion-2-1", torch_dtype=torch.float16)
+        pipeline = sd_cls.from_pretrained(
+            "sd2-community/stable-diffusion-2-1",
+            torch_dtype=torch.float16,
+        )
     else:
         raise ValueError(f"Unknown model name: {model_name}")
     
