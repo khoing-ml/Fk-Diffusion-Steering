@@ -286,6 +286,15 @@ def parse_args() -> argparse.Namespace:
         choices=["multinomial", "systematic", "stratified", "residual", "none"],
         help="Particle resampling strategy for SMC/FKD updates.",
     )
+    p.add_argument(
+        "--resample-strategies",
+        default=None,
+        help=(
+            "Comma-separated resampling strategies to sweep, e.g. "
+            "multinomial,systematic,stratified,residual,none. "
+            "If set, overrides --resample-strategy."
+        ),
+    )
     p.add_argument("--guidance-reward-fn", default="ImageReward")
     p.add_argument(
         "--fallback-reward-fn",
@@ -322,6 +331,15 @@ def _parse_float_csv(raw: str | None, *, fallback: float) -> List[float]:
     if not vals:
         return [fallback]
     return [float(v) for v in vals]
+
+
+def _parse_str_csv(raw: str | None, *, fallback: str) -> List[str]:
+    if not raw:
+        return [fallback]
+    vals = [v.strip() for v in raw.split(",") if v.strip()]
+    if not vals:
+        return [fallback]
+    return vals
 
 
 def resolve_guidance_reward_fn(*, reward_fn: str, fallback_reward_fn: str, allow_fallback: bool) -> str:
@@ -405,61 +423,80 @@ def main() -> None:
 
     seeds = _parse_int_csv(args.seeds, fallback=args.seed)
     svgd_step_sizes = _parse_float_csv(args.svgd_step_sizes, fallback=args.svgd_step_size)
+    resample_strategies = _parse_str_csv(
+        args.resample_strategies,
+        fallback=args.resample_strategy,
+    )
+    valid_resample_strategies = {"multinomial", "systematic", "stratified", "residual", "none"}
+    bad_strategies = [s for s in resample_strategies if s not in valid_resample_strategies]
+    if bad_strategies:
+        raise ValueError(
+            f"Invalid resample strategy(ies): {bad_strategies}. "
+            f"Valid options: {sorted(valid_resample_strategies)}"
+        )
     print(f"  seeds          = {seeds}")
     print(f"  svgd_step_sizes= {svgd_step_sizes}")
+    print(f"  resample_strategies = {resample_strategies}")
 
     pipe = get_model(args.model_name).to(device)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     rows: List[Dict] = []
 
-    for svgd_step_size in svgd_step_sizes:
-        for seed in seeds:
-            print(f"\n=== Sweep run: seed={seed}, svgd_step_size={svgd_step_size} ===")
-            for mode in modes:
-                print(f"Running mode: {mode}")
-                images, rewards, fkd_args = run_mode(
-                    pipe=pipe,
-                    do_eval=do_eval,
-                    prompt=args.prompt,
-                    mode=mode,
-                    seed=seed,
-                    num_particles=args.num_particles,
-                    time_steps=args.time_steps,
-                    lmbda=args.lmbda,
-                    svgd_step_size=svgd_step_size,
-                    svgd_sigma=args.svgd_sigma,
-                    guidance_reward_fn=args.guidance_reward_fn,
-                    resample_strategy=args.resample_strategy,
+    for resample_strategy in resample_strategies:
+        for svgd_step_size in svgd_step_sizes:
+            for seed in seeds:
+                print(
+                    "\n=== Sweep run: "
+                    f"strategy={resample_strategy}, seed={seed}, svgd_step_size={svgd_step_size} ==="
                 )
+                for mode in modes:
+                    print(f"Running mode: {mode}")
+                    images, rewards, fkd_args = run_mode(
+                        pipe=pipe,
+                        do_eval=do_eval,
+                        prompt=args.prompt,
+                        mode=mode,
+                        seed=seed,
+                        num_particles=args.num_particles,
+                        time_steps=args.time_steps,
+                        lmbda=args.lmbda,
+                        svgd_step_size=svgd_step_size,
+                        svgd_sigma=args.svgd_sigma,
+                        guidance_reward_fn=args.guidance_reward_fn,
+                        resample_strategy=resample_strategy,
+                    )
 
-                out_path = output_dir / f"{mode}_seed{seed}_step{svgd_step_size:.4f}.png"
-                show_or_save_images(
-                    images=images,
-                    rewards=rewards,
-                    title=(
-                        f"{args.model_name} | mode={mode} | seed={seed} | "
-                        f"svgd_step_size={svgd_step_size}"
-                    ),
-                    out_path=out_path,
-                    show=args.show,
-                )
+                    out_path = output_dir / (
+                        f"{mode}_rs-{resample_strategy}_seed{seed}_step{svgd_step_size:.4f}.png"
+                    )
+                    show_or_save_images(
+                        images=images,
+                        rewards=rewards,
+                        title=(
+                            f"{args.model_name} | mode={mode} | rs={resample_strategy} | "
+                            f"seed={seed} | svgd_step_size={svgd_step_size}"
+                        ),
+                        out_path=out_path,
+                        show=args.show,
+                    )
 
-                rows.append(
-                    {
-                        "mode": mode,
-                        "seed": seed,
-                        "svgd_step_size": svgd_step_size,
-                        "mean": float(rewards.mean()),
-                        "std": float(rewards.std()),
-                        "best": float(rewards.max()),
-                        "lmbda": args.lmbda,
-                        "num_particles": args.num_particles,
-                        "time_steps": args.time_steps,
-                        "reward_fn": args.guidance_reward_fn,
-                        "fkd_args": str(fkd_args),
-                    }
-                )
+                    rows.append(
+                        {
+                            "mode": mode,
+                            "resample_strategy": resample_strategy,
+                            "seed": seed,
+                            "svgd_step_size": svgd_step_size,
+                            "mean": float(rewards.mean()),
+                            "std": float(rewards.std()),
+                            "best": float(rewards.max()),
+                            "lmbda": args.lmbda,
+                            "num_particles": args.num_particles,
+                            "time_steps": args.time_steps,
+                            "reward_fn": args.guidance_reward_fn,
+                            "fkd_args": str(fkd_args),
+                        }
+                    )
 
     detail_csv = output_dir / "scores_detail.csv"
     with detail_csv.open("w", newline="", encoding="utf-8") as f:
@@ -467,6 +504,7 @@ def main() -> None:
             f,
             fieldnames=[
                 "mode",
+                "resample_strategy",
                 "seed",
                 "svgd_step_size",
                 "mean",
@@ -484,16 +522,21 @@ def main() -> None:
 
     grouped: Dict[Tuple[str, float], List[Dict]] = {}
     for row in rows:
-        key = (row["mode"], float(row["svgd_step_size"]))
+        key = (
+            row["mode"],
+            row["resample_strategy"],
+            float(row["svgd_step_size"]),
+        )
         grouped.setdefault(key, []).append(row)
 
     summary_rows: List[Dict] = []
-    for (mode, step), vals in grouped.items():
+    for (mode, resample_strategy, step), vals in grouped.items():
         means = np.array([v["mean"] for v in vals], dtype=np.float32)
         bests = np.array([v["best"] for v in vals], dtype=np.float32)
         summary_rows.append(
             {
                 "mode": mode,
+                "resample_strategy": resample_strategy,
                 "svgd_step_size": step,
                 "n_seeds": len(vals),
                 "mean_of_mean": float(means.mean()),
@@ -510,6 +553,7 @@ def main() -> None:
             f,
             fieldnames=[
                 "mode",
+                "resample_strategy",
                 "svgd_step_size",
                 "n_seeds",
                 "mean_of_mean",
@@ -525,6 +569,7 @@ def main() -> None:
         print(
             "  "
             f"mode={row['mode']:10s} "
+            f"rs={row['resample_strategy']:11s} "
             f"step={row['svgd_step_size']:.4f} "
             f"n={row['n_seeds']} "
             f"mean={row['mean_of_mean']:.4f} "
