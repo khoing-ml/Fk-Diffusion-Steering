@@ -128,6 +128,7 @@ def build_fkd_args(
     guidance_reward_fn: str,
     svgd_step_size: float,
     svgd_sigma: float | None,
+    resample_strategy: str,
 ) -> Dict:
     args = {
         "lmbda": lmbda,
@@ -140,6 +141,7 @@ def build_fkd_args(
         "num_particles": num_particles,
         "guidance_reward_fn": guidance_reward_fn,
         "metric_to_chase": None,
+        "resample_strategy": resample_strategy,
     }
 
     if use_smc:
@@ -197,6 +199,7 @@ def run_mode(
     svgd_step_size: float,
     svgd_sigma: float | None,
     guidance_reward_fn: str,
+    resample_strategy: str,
 ):
     if mode not in VALID_MODES:
         raise ValueError(f"Unknown mode: {mode}")
@@ -213,6 +216,7 @@ def run_mode(
             guidance_reward_fn=guidance_reward_fn,
             svgd_step_size=svgd_step_size,
             svgd_sigma=svgd_sigma,
+            resample_strategy=resample_strategy,
         )
     else:
         fkd_args = build_fkd_args(
@@ -224,6 +228,7 @@ def run_mode(
             guidance_reward_fn=guidance_reward_fn,
             svgd_step_size=svgd_step_size,
             svgd_sigma=svgd_sigma,
+            resample_strategy=resample_strategy,
         )
 
     prompts = [prompt] * num_particles
@@ -275,6 +280,12 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated evo step sizes for sweep, e.g. 0.03,0.06,0.1,0.15",
     )
     p.add_argument("--svgd-sigma", type=float, default=None)
+    p.add_argument(
+        "--resample-strategy",
+        default="multinomial",
+        choices=["multinomial", "systematic", "stratified", "residual", "none"],
+        help="Particle resampling strategy for SMC/FKD updates.",
+    )
     p.add_argument("--guidance-reward-fn", default="ImageReward")
     p.add_argument(
         "--fallback-reward-fn",
@@ -419,6 +430,7 @@ def main() -> None:
                     svgd_step_size=svgd_step_size,
                     svgd_sigma=args.svgd_sigma,
                     guidance_reward_fn=args.guidance_reward_fn,
+                    resample_strategy=args.resample_strategy,
                 )
 
                 out_path = output_dir / f"{mode}_seed{seed}_step{svgd_step_size:.4f}.png"

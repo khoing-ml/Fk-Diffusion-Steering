@@ -161,6 +161,7 @@ def main(args):
             resampling_t_end=args.resample_t_end,
             guidance_reward_fn=args.guidance_reward_fn,
             potential_type=args.potential_type,
+            resample_strategy=args.resample_strategy,
         )
 
         images = pipe(
@@ -273,6 +274,12 @@ def get_args():
     parser.add_argument("--resample_frequency", type=int, default=5)
     parser.add_argument("--resample_t_start", type=int, default=5)
     parser.add_argument("--resample_t_end", type=int, default=30)
+    parser.add_argument(
+        "--resample_strategy",
+        type=str,
+        default="multinomial",
+        choices=["multinomial", "systematic", "stratified", "residual", "none"],
+    )
     parser.add_argument(
         "--potential_type",
         type=str,

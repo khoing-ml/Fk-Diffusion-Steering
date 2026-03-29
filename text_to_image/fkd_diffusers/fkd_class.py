@@ -16,6 +16,15 @@ class PotentialType(Enum):
     EVOLUTION = "evolution"
 
 
+VALID_RESAMPLE_STRATEGIES = {
+    "multinomial",
+    "systematic",
+    "stratified",
+    "residual",
+    "none",
+}
+
+
 def _to_numpy_1d(values: Union[torch.Tensor, np.ndarray, list, tuple]) -> np.ndarray:
     if isinstance(values, torch.Tensor):
         values = values.detach().cpu().float().numpy()
@@ -60,6 +69,85 @@ def _safe_resampling_weights(
 
     weights = torch.clamp(weights, min=0.0)
     return weights / weights.sum()
+
+
+def _draw_multinomial_indices(weights: torch.Tensor, num_samples: int) -> torch.Tensor:
+    return torch.multinomial(weights, num_samples=num_samples, replacement=True)
+
+
+def _draw_systematic_indices(weights: torch.Tensor, num_samples: int) -> torch.Tensor:
+    device = weights.device
+    cdf = torch.cumsum(weights, dim=0)
+    cdf[-1] = 1.0
+
+    u0 = torch.rand(1, device=device) / float(num_samples)
+    positions = u0 + torch.arange(num_samples, device=device, dtype=weights.dtype) / float(num_samples)
+    positions = torch.clamp(positions, max=1.0 - 1e-8)
+    return torch.searchsorted(cdf, positions).to(torch.long)
+
+
+def _draw_stratified_indices(weights: torch.Tensor, num_samples: int) -> torch.Tensor:
+    device = weights.device
+    cdf = torch.cumsum(weights, dim=0)
+    cdf[-1] = 1.0
+
+    jitter = torch.rand(num_samples, device=device, dtype=weights.dtype)
+    positions = (torch.arange(num_samples, device=device, dtype=weights.dtype) + jitter) / float(num_samples)
+    positions = torch.clamp(positions, max=1.0 - 1e-8)
+    return torch.searchsorted(cdf, positions).to(torch.long)
+
+
+def _draw_residual_indices(weights: torch.Tensor, num_samples: int) -> torch.Tensor:
+    device = weights.device
+    expected = num_samples * weights
+    deterministic = torch.floor(expected).to(torch.long)
+    residual_count = int(num_samples - int(deterministic.sum().item()))
+
+    base_indices = torch.repeat_interleave(
+        torch.arange(weights.numel(), device=device, dtype=torch.long),
+        deterministic,
+    )
+
+    if residual_count <= 0:
+        if base_indices.numel() > num_samples:
+            base_indices = base_indices[:num_samples]
+        return base_indices
+
+    residual = expected - deterministic.to(expected.dtype)
+    residual_sum = residual.sum()
+    if residual_sum <= 0:
+        tail = _draw_systematic_indices(weights, residual_count)
+    else:
+        residual_weights = residual / residual_sum
+        tail = _draw_systematic_indices(residual_weights, residual_count)
+
+    out = torch.cat([base_indices, tail], dim=0)
+    if out.numel() < num_samples:
+        pad = _draw_systematic_indices(weights, num_samples - out.numel())
+        out = torch.cat([out, pad], dim=0)
+    elif out.numel() > num_samples:
+        out = out[:num_samples]
+    return out
+
+
+def _draw_resampled_indices(
+    *,
+    weights: torch.Tensor,
+    num_samples: int,
+    strategy: str,
+) -> torch.Tensor:
+    if strategy == "multinomial":
+        return _draw_multinomial_indices(weights, num_samples)
+    if strategy == "systematic":
+        return _draw_systematic_indices(weights, num_samples)
+    if strategy == "stratified":
+        return _draw_stratified_indices(weights, num_samples)
+    if strategy == "residual":
+        return _draw_residual_indices(weights, num_samples)
+    raise ValueError(
+        f"Unknown resample strategy '{strategy}'. "
+        f"Expected one of: {sorted(VALID_RESAMPLE_STRATEGIES)}"
+    )
 
 
 def _rbf_kernel(x: torch.Tensor, y: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
@@ -351,9 +439,9 @@ class FKD:
         lmbda: Lambda hyperparameter controlling weight scaling.
         num_particles: Number of particles to maintain in the population.
         adaptive_resampling: Whether to perform adaptive resampling.
-        resample_frequency: Frequency (in timesteps) to perform resampling.
-        resampling_t_start: Timestep to start resampling.
-        resampling_t_end: Timestep to stop resampling.
+        resample_frequency: Frequency (in timesteps) to apply FKD updates.
+        resampling_t_start: Timestep to start FKD updates.
+        resampling_t_end: Timestep to stop FKD updates.
         time_steps: Total number of timesteps in the sampling process.
         reward_fn: Function to compute rewards from decoded latents.
         reward_min_value: Minimum value for rewards (default: 0.0). Important for the Max potential type.
@@ -361,6 +449,8 @@ class FKD:
         device: Device on which computations will be performed (default: CUDA).
         svgd_step_size: Step size for SVGD vector field application in evolution steering (default: 0.1).
         svgd_sigma: Bandwidth for SVGD RBF kernel. If None, uses median pairwise distance.
+        resample_strategy: Resampling strategy used when resampling is enabled.
+            Supported: multinomial, systematic, stratified, residual, none.
         alpha_bar_fn: Optional callback mapping sampling index -> alpha_bar_t for score-based SVGD.
         **kwargs: Additional keyword arguments, unused.
     """
@@ -382,6 +472,7 @@ class FKD:
         device: torch.device = torch.device('cuda'),
         svgd_step_size: float = 0.1,
         svgd_sigma: Optional[float] = None,
+        resample_strategy: str = "multinomial",
         alpha_bar_fn: Optional[Callable[[int], Optional[float]]] = None,
         **kwargs,
     ) -> None:
@@ -405,6 +496,12 @@ class FKD:
         # SVGD parameters
         self.svgd_step_size = svgd_step_size
         self.svgd_sigma = svgd_sigma
+        self.resample_strategy = str(resample_strategy).lower()
+        if self.resample_strategy not in VALID_RESAMPLE_STRATEGIES:
+            raise ValueError(
+                f"Unknown resample strategy '{self.resample_strategy}'. "
+                f"Expected one of: {sorted(VALID_RESAMPLE_STRATEGIES)}"
+            )
         self.alpha_bar_fn = alpha_bar_fn
 
         # Initialize device and population reward state
@@ -420,9 +517,9 @@ class FKD:
         self, *, sampling_idx: int, latents: torch.Tensor, x0_preds: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Perform resampling of particles if conditions are met.
-        Includes binary scoring for evolution steering using existing reward functions.
-        For evolution steering, applies SVGD to steer particles from bad to good regions.
+        Perform an FKD update when the current timestep is in the configured interval.
+        For non-evolution potentials this is a particle resampling step.
+        For evolution potential, optional resampling is followed by SVGD latent adjustment.
 
         Args:
             sampling_idx: Current sampling index (timestep).
@@ -430,7 +527,7 @@ class FKD:
             x0_preds: Predictions for x0 based on latents.
 
         Returns:
-            A tuple containing resampled latents and optionally resampled images.
+            A tuple containing updated latents and optionally decoded images.
         """
         # Check if resampling is within the allowed range and conditions
         resampling_interval = np.arange(
@@ -447,9 +544,26 @@ class FKD:
         rewards = self.reward_fn(decoded_images)
 
         if self.potential_type == PotentialType.EVOLUTION:
-            # Evolution mode uses SVGD only as a latent adjustment step.
-            # No particle resampling is performed to avoid selection-driven collapse.
             binary_rewards = evolution_steering_binary_rewards(rewards=rewards)
+
+            if self.resample_strategy != "none":
+                resampling_weights = _safe_resampling_weights(
+                    binary_rewards,
+                    device=latents.device,
+                )
+                resampled_indices = _draw_resampled_indices(
+                    weights=resampling_weights,
+                    num_samples=self.num_particles,
+                    strategy=self.resample_strategy,
+                )
+                latents = latents[resampled_indices]
+                x0_preds = x0_preds[resampled_indices]
+                decoded_images = (
+                    decoded_images[resampled_indices]
+                    if decoded_images is not None
+                    else None
+                )
+                binary_rewards = [binary_rewards[i] for i in resampled_indices.tolist()]
 
             alpha_bar_t = None
             if self.alpha_bar_fn is not None:
@@ -468,12 +582,14 @@ class FKD:
             return steered_latents, decoded_images
             
         else:
-            resampling_weights = _safe_resampling_weights(rewards, device=latents.device)
+            if self.resample_strategy == "none":
+                return latents, decoded_images
 
-            resampled_indices = torch.multinomial(
-                resampling_weights,
+            resampling_weights = _safe_resampling_weights(rewards, device=latents.device)
+            resampled_indices = _draw_resampled_indices(
+                weights=resampling_weights,
                 num_samples=self.num_particles,
-                replacement=True,
+                strategy=self.resample_strategy,
             )
 
             resampled_latents = latents[resampled_indices]
