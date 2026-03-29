@@ -447,47 +447,25 @@ class FKD:
         rewards = self.reward_fn(decoded_images)
 
         if self.potential_type == PotentialType.EVOLUTION:
-            # Get binary rewards for evolution steering
+            # Evolution mode uses SVGD only as a latent adjustment step.
+            # No particle resampling is performed to avoid selection-driven collapse.
             binary_rewards = evolution_steering_binary_rewards(rewards=rewards)
-            
-            # Standard resampling based on binary rewards
-            resampling_weights = _safe_resampling_weights(
-                binary_rewards,
-                device=latents.device,
-            )
-            
-            resampled_indices = torch.multinomial(
-                resampling_weights,
-                num_samples=self.num_particles,
-                replacement=True,
-            )
-            
-            resampled_latents = latents[resampled_indices]
-            resampled_images = (
-                decoded_images[resampled_indices] if decoded_images is not None else None
-            )
-
-            # Apply SVGD steering in x_t space using mixture-score approximation when alpha_bar is available.
-            resampled_x0_preds = x0_preds[resampled_indices]
-            resampled_binary_rewards = [
-                binary_rewards[i] for i in resampled_indices.tolist()
-            ]
 
             alpha_bar_t = None
             if self.alpha_bar_fn is not None:
                 alpha_bar_t = self.alpha_bar_fn(sampling_idx)
 
             steered_latents = apply_svgd_steering(
-                particles=resampled_latents,
-                binary_rewards=resampled_binary_rewards,
-                x0_particles=resampled_x0_preds,
+                particles=latents,
+                binary_rewards=binary_rewards,
+                x0_particles=x0_preds,
                 alpha_bar_t=alpha_bar_t,
                 step_size=self.svgd_step_size,
                 sigma=self.svgd_sigma,
                 device=latents.device,
             )
 
-            return steered_latents, resampled_images
+            return steered_latents, decoded_images
             
         else:
             resampling_weights = _safe_resampling_weights(rewards, device=latents.device)
