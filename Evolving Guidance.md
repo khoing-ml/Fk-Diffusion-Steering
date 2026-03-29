@@ -128,3 +128,76 @@ What if the new generated sample already belongs to $q_t(x|c)$?
 
 1.  And which timestep we should steer to prevent the quality of samples?
 - High noise (high $t$) >< Low noise (low $t$)
+
+## 4. Implementation Plan
+
+### Goal
+
+Build an evolution-guidance variant that **collects a diverse set of good and bad samples before applying strong guidance**, instead of estimating the guidance direction from only the current particle batch.
+
+### Core idea
+
+At each selected denoising step:
+
+1. Run the base diffusion update and decode the predicted $x_0$ samples.
+2. Score the particle population with the reward model.
+3. Add the current high-reward and low-reward $x_0$ predictions to a bounded archive.
+4. Keep the archive diverse by deduplicating anchors and pruning dense clusters.
+5. Delay SVGD guidance until the archive contains enough useful anchors.
+6. Once the archive is mature, guide the current particles using the archived good and bad sets rather than only the current batch.
+
+### Archive design
+
+- Maintain two archives:
+  - **Good archive**: top-quantile reward samples
+  - **Bad archive**: bottom-quantile reward samples
+- Each archive should:
+  - keep at most a fixed number of anchors
+  - prefer high-quality anchors
+  - preserve diversity across modes
+  - remove exact duplicates created by resampling
+
+### Guidance rule
+
+Use a delayed, contrastive guidance signal:
+
+$$
+\phi_t(x) \approx \text{SVGD}(q_t^{good}) - \beta \, \text{SVGD}(q_t^{bad})
+$$
+
+or, in the score-based version,
+
+$$
+s_t(x) \approx \nabla_x \log q_t^{good}(x) - \beta \nabla_x \log q_t^{bad}(x)
+$$
+
+where the good and bad conditional densities are approximated from the archived $x_0$ anchors.
+
+### Practical schedule
+
+- **Warm-up / burn-in**: collect archive samples first, with weak or no guidance.
+- **Start guidance only when**:
+  - the number of unique good anchors is large enough
+  - optionally the number of bad anchors is large enough
+  - the archive covers multiple modes
+- **Apply guidance at a controllable frequency**, rather than at every step.
+- **Keep resampling sparse or disabled** during early experiments to reduce collapse.
+
+### First experiment version
+
+- Use a global prompt-level archive of good and bad $x_0$ predictions.
+- Keep top 25% as good and bottom 25% as bad.
+- Use a burn-in period before guidance starts.
+- Guide every few steps, not every step.
+- Compare:
+  - current online guidance
+  - delayed archive guidance
+  - archive guidance with bad-sample repulsion
+
+### Diagnostics to track
+
+- number of unique good anchors over time
+- number of unique bad anchors over time
+- reward histogram at each step
+- pairwise diversity of the archive
+- whether guidance improves reward without collapsing to one visual mode

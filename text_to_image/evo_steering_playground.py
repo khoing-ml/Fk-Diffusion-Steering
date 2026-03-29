@@ -26,12 +26,6 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
-from PIL import Image
-
-
 VALID_MODES = {"base", "diff", "max", "evolution"}
 VALID_REWARD_FNS = {
     "ImageReward",
@@ -48,6 +42,30 @@ def _version(mod_name: str) -> str | None:
         return getattr(mod, "__version__", "unknown")
     except Exception:
         return None
+
+
+def _require_numpy():
+    import numpy as np
+
+    return np
+
+
+def _require_torch():
+    import torch
+
+    return torch
+
+
+def _require_pyplot():
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
+def _require_pil_image():
+    from PIL import Image
+
+    return Image
 
 
 def ensure_dependency_compat(*, auto_fix: bool) -> None:
@@ -110,6 +128,8 @@ def resolve_paths() -> Tuple[Path, Path]:
 
 
 def seed_everything(seed: int) -> None:
+    np = _require_numpy()
+    torch = _require_torch()
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -129,6 +149,14 @@ def build_fkd_args(
     svgd_step_size: float,
     svgd_sigma: float | None,
     guidance_frequency: int | None,
+    use_anchor_archive: bool,
+    archive_size: int,
+    archive_good_quantile: float,
+    archive_bad_quantile: float,
+    archive_burn_in_steps: int,
+    min_good_anchors: int,
+    min_bad_anchors: int,
+    bad_guidance_strength: float,
     resample_strategy: str,
 ) -> Dict:
     args = {
@@ -157,6 +185,14 @@ def build_fkd_args(
         args["svgd_step_size"] = svgd_step_size
         args["svgd_sigma"] = svgd_sigma
         args["guidance_frequency"] = effective_guidance_frequency
+        args["use_anchor_archive"] = use_anchor_archive
+        args["archive_size"] = archive_size
+        args["archive_good_quantile"] = archive_good_quantile
+        args["archive_bad_quantile"] = archive_bad_quantile
+        args["archive_burn_in_steps"] = archive_burn_in_steps
+        args["min_good_anchors"] = min_good_anchors
+        args["min_bad_anchors"] = min_bad_anchors
+        args["bad_guidance_strength"] = bad_guidance_strength
 
     return args
 
@@ -169,6 +205,7 @@ def show_or_save_images(
     out_path: Path | None,
     show: bool,
 ) -> None:
+    plt = _require_pyplot()
     n = len(images)
     fig, axes = plt.subplots(1, n, figsize=(4 * n, 4), dpi=160)
     if n == 1:
@@ -206,10 +243,19 @@ def run_mode(
     svgd_step_size: float,
     svgd_sigma: float | None,
     guidance_frequency: int | None,
+    use_anchor_archive: bool,
+    archive_size: int,
+    archive_good_quantile: float,
+    archive_bad_quantile: float,
+    archive_burn_in_steps: int,
+    min_good_anchors: int,
+    min_bad_anchors: int,
+    bad_guidance_strength: float,
     guidance_reward_fn: str,
     resample_strategy: str,
     evolution_resample_strategy: str,
 ):
+    np = _require_numpy()
     if mode not in VALID_MODES:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -230,6 +276,14 @@ def run_mode(
             svgd_step_size=svgd_step_size,
             svgd_sigma=svgd_sigma,
             guidance_frequency=guidance_frequency,
+            use_anchor_archive=use_anchor_archive,
+            archive_size=archive_size,
+            archive_good_quantile=archive_good_quantile,
+            archive_bad_quantile=archive_bad_quantile,
+            archive_burn_in_steps=archive_burn_in_steps,
+            min_good_anchors=min_good_anchors,
+            min_bad_anchors=min_bad_anchors,
+            bad_guidance_strength=bad_guidance_strength,
             resample_strategy=effective_resample_strategy,
         )
     else:
@@ -243,6 +297,14 @@ def run_mode(
             svgd_step_size=svgd_step_size,
             svgd_sigma=svgd_sigma,
             guidance_frequency=guidance_frequency,
+            use_anchor_archive=use_anchor_archive,
+            archive_size=archive_size,
+            archive_good_quantile=archive_good_quantile,
+            archive_bad_quantile=archive_bad_quantile,
+            archive_burn_in_steps=archive_burn_in_steps,
+            min_good_anchors=min_good_anchors,
+            min_bad_anchors=min_bad_anchors,
+            bad_guidance_strength=bad_guidance_strength,
             resample_strategy=effective_resample_strategy,
         )
 
@@ -298,6 +360,53 @@ def parse_args() -> argparse.Namespace:
             "If omitted, evolution guidance follows --resample-frequency's effective cadence "
             "(currently the built-in default of 10 in this script)."
         ),
+    )
+    p.add_argument(
+        "--use-anchor-archive",
+        action="store_true",
+        help="Accumulate good/bad x0 anchors before applying evolution guidance.",
+    )
+    p.add_argument(
+        "--archive-size",
+        type=int,
+        default=64,
+        help="Maximum number of archived good anchors and bad anchors to retain.",
+    )
+    p.add_argument(
+        "--archive-good-quantile",
+        type=float,
+        default=0.75,
+        help="Reward quantile for admitting good anchors into the archive.",
+    )
+    p.add_argument(
+        "--archive-bad-quantile",
+        type=float,
+        default=0.25,
+        help="Reward quantile for admitting bad anchors into the archive.",
+    )
+    p.add_argument(
+        "--archive-burn-in-steps",
+        type=int,
+        default=0,
+        help="Number of early evolution steps used only for archive collection.",
+    )
+    p.add_argument(
+        "--min-good-anchors",
+        type=int,
+        default=8,
+        help="Minimum archived good anchors required before archive guidance starts.",
+    )
+    p.add_argument(
+        "--min-bad-anchors",
+        type=int,
+        default=0,
+        help="Minimum archived bad anchors required before contrastive bad guidance starts.",
+    )
+    p.add_argument(
+        "--bad-guidance-strength",
+        type=float,
+        default=0.0,
+        help="Strength of bad-anchor repulsion in archive-based evolution guidance.",
     )
     p.add_argument(
         "--svgd-step-sizes",
@@ -391,6 +500,7 @@ def resolve_guidance_reward_fn(*, reward_fn: str, fallback_reward_fn: str, allow
         return reward_fn
 
     try:
+        Image = _require_pil_image()
         from fkd_diffusers.rewards import do_image_reward
 
         # Tiny smoke test to trigger backend import early.
@@ -411,6 +521,8 @@ def resolve_guidance_reward_fn(*, reward_fn: str, fallback_reward_fn: str, allow
 
 
 def main() -> None:
+    np = _require_numpy()
+    torch = _require_torch()
     args = parse_args()
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
@@ -419,6 +531,18 @@ def main() -> None:
     invalid = [m for m in modes if m not in VALID_MODES]
     if invalid:
         raise ValueError(f"Invalid mode(s): {invalid}. Valid modes: {sorted(VALID_MODES)}")
+    if args.archive_size <= 0:
+        raise ValueError("--archive-size must be > 0")
+    if not (0.0 <= args.archive_bad_quantile < args.archive_good_quantile <= 1.0):
+        raise ValueError(
+            "Expected 0 <= --archive-bad-quantile < --archive-good-quantile <= 1"
+        )
+    if args.archive_burn_in_steps < 0:
+        raise ValueError("--archive-burn-in-steps must be >= 0")
+    if args.min_good_anchors < 0 or args.min_bad_anchors < 0:
+        raise ValueError("--min-good-anchors and --min-bad-anchors must be >= 0")
+    if args.bad_guidance_strength < 0:
+        raise ValueError("--bad-guidance-strength must be >= 0")
 
     ensure_dependency_compat(auto_fix=args.auto_fix_deps)
 
@@ -471,6 +595,14 @@ def main() -> None:
     print(f"  seeds          = {seeds}")
     print(f"  svgd_step_sizes= {svgd_step_sizes}")
     print(f"  guidance_frequency = {args.guidance_frequency}")
+    print(f"  use_anchor_archive = {args.use_anchor_archive}")
+    print(f"  archive_size   = {args.archive_size}")
+    print(f"  archive_good_q = {args.archive_good_quantile}")
+    print(f"  archive_bad_q  = {args.archive_bad_quantile}")
+    print(f"  archive_burn_in_steps = {args.archive_burn_in_steps}")
+    print(f"  min_good_anchors = {args.min_good_anchors}")
+    print(f"  min_bad_anchors  = {args.min_bad_anchors}")
+    print(f"  bad_guidance_strength = {args.bad_guidance_strength}")
     print(f"  resample_strategies = {resample_strategies}")
     print(f"  evolution_resample_strategy = {args.evolution_resample_strategy}")
 
@@ -500,6 +632,14 @@ def main() -> None:
                         svgd_step_size=svgd_step_size,
                         svgd_sigma=args.svgd_sigma,
                         guidance_frequency=args.guidance_frequency,
+                        use_anchor_archive=args.use_anchor_archive,
+                        archive_size=args.archive_size,
+                        archive_good_quantile=args.archive_good_quantile,
+                        archive_bad_quantile=args.archive_bad_quantile,
+                        archive_burn_in_steps=args.archive_burn_in_steps,
+                        min_good_anchors=args.min_good_anchors,
+                        min_bad_anchors=args.min_bad_anchors,
+                        bad_guidance_strength=args.bad_guidance_strength,
                         guidance_reward_fn=args.guidance_reward_fn,
                         resample_strategy=resample_strategy,
                         evolution_resample_strategy=args.evolution_resample_strategy,
@@ -509,7 +649,8 @@ def main() -> None:
                     guidance_tag = ""
                     if mode == "evolution":
                         guidance_value = fkd_args.get("guidance_frequency")
-                        guidance_tag = f"_gfreq{guidance_value}"
+                        archive_tag = "_archive" if fkd_args.get("use_anchor_archive") else ""
+                        guidance_tag = f"_gfreq{guidance_value}{archive_tag}"
                     out_path = output_dir / (
                         f"{mode}_rs-{effective_resample_strategy}{guidance_tag}_seed{seed}_step{svgd_step_size:.4f}.png"
                     )
@@ -519,7 +660,8 @@ def main() -> None:
                         title=(
                             f"{args.model_name} | mode={mode} | rs={effective_resample_strategy} | "
                             f"seed={seed} | svgd_step_size={svgd_step_size} | "
-                            f"guidance_frequency={fkd_args.get('guidance_frequency')}"
+                            f"guidance_frequency={fkd_args.get('guidance_frequency')} | "
+                            f"archive={fkd_args.get('use_anchor_archive', False)}"
                         ),
                         out_path=out_path,
                         show=args.show,
@@ -532,6 +674,7 @@ def main() -> None:
                             "seed": seed,
                             "svgd_step_size": svgd_step_size,
                             "guidance_frequency": fkd_args.get("guidance_frequency"),
+                            "use_anchor_archive": fkd_args.get("use_anchor_archive", False),
                             "mean": float(rewards.mean()),
                             "std": float(rewards.std()),
                             "best": float(rewards.max()),
@@ -553,6 +696,7 @@ def main() -> None:
                 "seed",
                 "svgd_step_size",
                 "guidance_frequency",
+                "use_anchor_archive",
                 "mean",
                 "std",
                 "best",
@@ -566,18 +710,19 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    grouped: Dict[Tuple[str, str, float, int | None], List[Dict]] = {}
+    grouped: Dict[Tuple[str, str, float, int | None, bool], List[Dict]] = {}
     for row in rows:
         key = (
             row["mode"],
             row["resample_strategy"],
             float(row["svgd_step_size"]),
             row["guidance_frequency"],
+            bool(row["use_anchor_archive"]),
         )
         grouped.setdefault(key, []).append(row)
 
     summary_rows: List[Dict] = []
-    for (mode, resample_strategy, step, guidance_frequency), vals in grouped.items():
+    for (mode, resample_strategy, step, guidance_frequency, use_anchor_archive), vals in grouped.items():
         means = np.array([v["mean"] for v in vals], dtype=np.float32)
         bests = np.array([v["best"] for v in vals], dtype=np.float32)
         summary_rows.append(
@@ -586,6 +731,7 @@ def main() -> None:
                 "resample_strategy": resample_strategy,
                 "svgd_step_size": step,
                 "guidance_frequency": guidance_frequency,
+                "use_anchor_archive": use_anchor_archive,
                 "n_seeds": len(vals),
                 "mean_of_mean": float(means.mean()),
                 "std_of_mean": float(means.std()),
@@ -604,6 +750,7 @@ def main() -> None:
                 "resample_strategy",
                 "svgd_step_size",
                 "guidance_frequency",
+                "use_anchor_archive",
                 "n_seeds",
                 "mean_of_mean",
                 "std_of_mean",
@@ -621,6 +768,7 @@ def main() -> None:
             f"rs={row['resample_strategy']:11s} "
             f"step={row['svgd_step_size']:.4f} "
             f"gfreq={row['guidance_frequency']} "
+            f"archive={row['use_anchor_archive']} "
             f"n={row['n_seeds']} "
             f"mean={row['mean_of_mean']:.4f} "
             f"std={row['std_of_mean']:.4f} "

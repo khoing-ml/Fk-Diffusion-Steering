@@ -31,6 +31,16 @@ def _to_numpy_1d(values: Union[torch.Tensor, np.ndarray, list, tuple]) -> np.nda
     return np.asarray(values, dtype=np.float32).reshape(-1)
 
 
+def _to_tensor_1d(
+    values: Union[torch.Tensor, np.ndarray, list, tuple],
+    *,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    if isinstance(values, torch.Tensor):
+        return values.detach().to(device=device, dtype=torch.float32).flatten()
+    return torch.as_tensor(values, dtype=torch.float32, device=device).flatten()
+
+
 def evolution_steering_binary_rewards(
     *,
     rewards: Union[torch.Tensor, np.ndarray, list, tuple],
@@ -229,6 +239,108 @@ def _clip_vector_field(
     return vector_field * scale
 
 
+def _dedupe_anchor_particles(
+    anchors: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    keep_highest: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Collapse exact duplicate anchors while keeping the most informative score."""
+    if anchors.numel() == 0 or anchors.shape[0] <= 1:
+        return anchors, scores
+
+    flat = anchors.reshape(anchors.shape[0], -1)
+    flat_unique = flat.float() if flat.dtype in (torch.float16, torch.bfloat16) else flat
+    unique_flat, inverse = torch.unique(flat_unique, dim=0, return_inverse=True)
+
+    reduced_scores = []
+    for idx in range(unique_flat.shape[0]):
+        matched_scores = scores[inverse == idx]
+        reduced_scores.append(
+            matched_scores.max() if keep_highest else matched_scores.min()
+        )
+
+    reduced_scores = torch.stack(reduced_scores).to(device=scores.device, dtype=scores.dtype)
+    unique_anchors = unique_flat.to(device=anchors.device, dtype=anchors.dtype).reshape(
+        -1, *anchors.shape[1:]
+    )
+    return unique_anchors, reduced_scores
+
+
+def _prune_anchor_particles(
+    anchors: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    max_size: int,
+    keep_highest: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Keep a bounded, diverse archive of anchors.
+
+    Anchors are ordered by reward quality and then greedily diversified with
+    farthest-point selection so one dense mode cannot monopolize the bank.
+    """
+    if anchors.numel() == 0 or anchors.shape[0] <= max_size:
+        return anchors, scores
+
+    order = torch.argsort(scores, descending=keep_highest)
+    anchors = anchors[order]
+    scores = scores[order]
+
+    if max_size == 1:
+        return anchors[:1], scores[:1]
+
+    flat = anchors.reshape(anchors.shape[0], -1)
+    flat = flat.float() if flat.dtype in (torch.float16, torch.bfloat16) else flat
+    selected = [0]
+    min_dists = torch.cdist(flat[:1], flat).squeeze(0)
+    score_bonus = torch.linspace(1.0, 0.0, anchors.shape[0], device=flat.device)
+
+    while len(selected) < max_size:
+        candidate_value = min_dists + 1e-3 * score_bonus
+        candidate_value[selected] = -1.0
+        next_idx = int(torch.argmax(candidate_value).item())
+        selected.append(next_idx)
+        dist_to_new = torch.cdist(flat[next_idx : next_idx + 1], flat).squeeze(0)
+        min_dists = torch.minimum(min_dists, dist_to_new)
+
+    selected_idx = torch.tensor(selected, device=anchors.device, dtype=torch.long)
+    return anchors[selected_idx], scores[selected_idx]
+
+
+def _update_anchor_bank(
+    *,
+    bank_anchors: Optional[torch.Tensor],
+    bank_scores: Optional[torch.Tensor],
+    new_anchors: torch.Tensor,
+    new_scores: torch.Tensor,
+    max_size: int,
+    keep_highest: bool,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if new_anchors.numel() == 0 or new_scores.numel() == 0:
+        return bank_anchors, bank_scores
+
+    if bank_anchors is None or bank_scores is None:
+        merged_anchors = new_anchors
+        merged_scores = new_scores
+    else:
+        merged_anchors = torch.cat([bank_anchors, new_anchors], dim=0)
+        merged_scores = torch.cat([bank_scores, new_scores], dim=0)
+
+    merged_anchors, merged_scores = _dedupe_anchor_particles(
+        merged_anchors,
+        merged_scores,
+        keep_highest=keep_highest,
+    )
+    merged_anchors, merged_scores = _prune_anchor_particles(
+        merged_anchors,
+        merged_scores,
+        max_size=max_size,
+        keep_highest=keep_highest,
+    )
+    return merged_anchors, merged_scores
+
+
 def _score_xt_given_x0_mixture(
     *,
     xt_flat: torch.Tensor,
@@ -275,6 +387,8 @@ def _compute_svgd_vector_field_mixture_score(
     *,
     xt_particles: torch.Tensor,
     x0_good_anchors: torch.Tensor,
+    x0_bad_anchors: Optional[torch.Tensor] = None,
+    bad_guidance_strength: float = 0.0,
     sigma: Optional[float] = None,
     device: torch.device,
     alpha_bar_t: float,
@@ -303,6 +417,15 @@ def _compute_svgd_vector_field_mixture_score(
         x0_good_flat=good,
         alpha_bar_t=alpha_bar_t,
     )  # (n, d)
+    if x0_bad_anchors is not None and bad_guidance_strength > 0.0:
+        bad = x0_bad_anchors.reshape(x0_bad_anchors.shape[0], -1).to(device)
+        if bad.shape[0] > 0:
+            bad_score = _score_xt_given_x0_mixture(
+                xt_flat=x,
+                x0_good_flat=bad,
+                alpha_bar_t=alpha_bar_t,
+            )
+            score = score - float(bad_guidance_strength) * bad_score
 
     # K[j, i] = k(x_j, x_i)
     K = _rbf_kernel(x, x, sigma=sigma)  # (n, n)
@@ -366,7 +489,9 @@ def compute_svgd_vector_field(
     *,
     x0_particles: Optional[torch.Tensor] = None,
     good_anchor_x0: Optional[torch.Tensor] = None,
+    bad_anchor_x0: Optional[torch.Tensor] = None,
     alpha_bar_t: Optional[float] = None,
+    bad_guidance_strength: float = 0.0,
     sigma: Optional[float] = None,
     device: torch.device = torch.device('cuda'),
 ) -> torch.Tensor:
@@ -391,7 +516,9 @@ def compute_svgd_vector_field(
         x0_particles: Predicted clean samples x0 aligned with particles, shape compatible with `particles`.
         good_anchor_x0: Optional explicit good-anchor set. Useful for evolution steering
             when the current particle population already contains resampled duplicates.
+        bad_anchor_x0: Optional explicit bad-anchor set for contrastive archive guidance.
         alpha_bar_t: Forward diffusion alpha_bar at the current timestep.
+        bad_guidance_strength: Strength of bad-anchor repulsion in the mixture-score path.
         sigma: Bandwidth for RBF kernel. If None, uses median pairwise distance.
         device: Device for computation
     
@@ -405,9 +532,13 @@ def compute_svgd_vector_field(
 
     if good_anchor_x0 is not None and alpha_bar_t is not None:
         good_anchor_x0 = _unique_anchor_particles(good_anchor_x0)
+        if bad_anchor_x0 is not None:
+            bad_anchor_x0 = _unique_anchor_particles(bad_anchor_x0)
         return _compute_svgd_vector_field_mixture_score(
             xt_particles=particles,
             x0_good_anchors=good_anchor_x0,
+            x0_bad_anchors=bad_anchor_x0,
+            bad_guidance_strength=bad_guidance_strength,
             sigma=sigma,
             device=device,
             alpha_bar_t=float(alpha_bar_t),
@@ -429,8 +560,10 @@ def apply_svgd_steering(
     binary_rewards: list[int],
     x0_particles: Optional[torch.Tensor] = None,
     good_anchor_x0: Optional[torch.Tensor] = None,
+    bad_anchor_x0: Optional[torch.Tensor] = None,
     alpha_bar_t: Optional[float] = None,
     step_size: float = 0.1,
+    bad_guidance_strength: float = 0.0,
     sigma: Optional[float] = None,
     device: torch.device = torch.device('cuda'),
 ) -> torch.Tensor:
@@ -441,8 +574,11 @@ def apply_svgd_steering(
         particles: Particle population of shape (num_particles, *spatial_dims)
         binary_rewards: Binary labels (0=bad, 1=good) for each particle
         x0_particles: Predicted clean samples x0 used for score approximation.
+        good_anchor_x0: Optional explicit good-anchor set.
+        bad_anchor_x0: Optional explicit bad-anchor set for contrastive archive guidance.
         alpha_bar_t: Forward diffusion alpha_bar at the current timestep.
         step_size: Step size for gradient update (default: 0.1)
+        bad_guidance_strength: Strength of bad-anchor repulsion in the mixture-score path.
         sigma: Bandwidth for RBF kernel. If None, uses median pairwise distance.
         device: Device for computation
     
@@ -454,7 +590,9 @@ def apply_svgd_steering(
         binary_rewards=binary_rewards,
         x0_particles=x0_particles,
         good_anchor_x0=good_anchor_x0,
+        bad_anchor_x0=bad_anchor_x0,
         alpha_bar_t=alpha_bar_t,
+        bad_guidance_strength=bad_guidance_strength,
         sigma=sigma,
         device=device,
     )
@@ -486,6 +624,14 @@ class FKD:
         svgd_sigma: Bandwidth for SVGD RBF kernel. If None, uses median pairwise distance.
         guidance_frequency: Frequency (in timesteps) for applying SVGD guidance in evolution mode.
             If None, defaults to `resample_frequency` to preserve the previous behavior.
+        use_anchor_archive: Whether to accumulate good/bad x0 anchors before guidance.
+        archive_size: Maximum number of good and bad anchors retained in the archive.
+        archive_good_quantile: Reward quantile used to admit good anchors into the archive.
+        archive_bad_quantile: Reward quantile used to admit bad anchors into the archive.
+        archive_burn_in_steps: Number of initial evolution steps used only for collection.
+        min_good_anchors: Minimum number of archived good anchors required before archive guidance starts.
+        min_bad_anchors: Minimum number of archived bad anchors required before contrastive bad guidance starts.
+        bad_guidance_strength: Strength of archived bad-anchor repulsion in the mixture-score path.
         resample_strategy: Resampling strategy used when resampling is enabled.
             Supported: multinomial, systematic, stratified, residual, none.
         alpha_bar_fn: Optional callback mapping sampling index -> alpha_bar_t for score-based SVGD.
@@ -510,6 +656,14 @@ class FKD:
         svgd_step_size: float = 0.1,
         svgd_sigma: Optional[float] = None,
         guidance_frequency: Optional[int] = None,
+        use_anchor_archive: bool = False,
+        archive_size: int = 64,
+        archive_good_quantile: float = 0.75,
+        archive_bad_quantile: float = 0.25,
+        archive_burn_in_steps: int = 0,
+        min_good_anchors: int = 8,
+        min_bad_anchors: int = 0,
+        bad_guidance_strength: float = 0.0,
         resample_strategy: str = "multinomial",
         alpha_bar_fn: Optional[Callable[[int], Optional[float]]] = None,
         **kwargs,
@@ -539,6 +693,24 @@ class FKD:
         )
         if self.guidance_frequency <= 0:
             raise ValueError("guidance_frequency must be a positive integer.")
+        self.use_anchor_archive = bool(use_anchor_archive)
+        self.archive_size = int(archive_size)
+        self.archive_good_quantile = float(archive_good_quantile)
+        self.archive_bad_quantile = float(archive_bad_quantile)
+        self.archive_burn_in_steps = int(archive_burn_in_steps)
+        self.min_good_anchors = int(min_good_anchors)
+        self.min_bad_anchors = int(min_bad_anchors)
+        self.bad_guidance_strength = float(max(0.0, bad_guidance_strength))
+        if self.archive_size <= 0:
+            raise ValueError("archive_size must be a positive integer.")
+        if not (0.0 <= self.archive_bad_quantile < self.archive_good_quantile <= 1.0):
+            raise ValueError(
+                "Expected 0 <= archive_bad_quantile < archive_good_quantile <= 1."
+            )
+        if self.archive_burn_in_steps < 0:
+            raise ValueError("archive_burn_in_steps must be >= 0.")
+        if self.min_good_anchors < 0 or self.min_bad_anchors < 0:
+            raise ValueError("min_good_anchors and min_bad_anchors must be >= 0.")
         self.resample_strategy = str(resample_strategy).lower()
         if self.resample_strategy not in VALID_RESAMPLE_STRATEGIES:
             raise ValueError(
@@ -555,6 +727,71 @@ class FKD:
             torch.ones(self.num_particles, device=self.device) * reward_min_value
         )
         self.product_of_potentials = torch.ones(self.num_particles).to(self.device)
+        self.archive_good_anchors: Optional[torch.Tensor] = None
+        self.archive_good_scores: Optional[torch.Tensor] = None
+        self.archive_bad_anchors: Optional[torch.Tensor] = None
+        self.archive_bad_scores: Optional[torch.Tensor] = None
+
+    def _update_evolution_archive(
+        self,
+        *,
+        x0_preds: torch.Tensor,
+        rewards: Union[torch.Tensor, np.ndarray, list, tuple],
+    ) -> None:
+        if not self.use_anchor_archive:
+            return
+
+        reward_tensor = _to_tensor_1d(rewards, device=x0_preds.device)
+        if reward_tensor.numel() == 0:
+            return
+
+        good_threshold = torch.quantile(reward_tensor, self.archive_good_quantile)
+        bad_threshold = torch.quantile(reward_tensor, self.archive_bad_quantile)
+
+        good_mask = reward_tensor >= good_threshold
+        bad_mask = reward_tensor <= bad_threshold
+
+        if good_mask.any():
+            self.archive_good_anchors, self.archive_good_scores = _update_anchor_bank(
+                bank_anchors=self.archive_good_anchors,
+                bank_scores=self.archive_good_scores,
+                new_anchors=x0_preds[good_mask].detach().cpu(),
+                new_scores=reward_tensor[good_mask].detach().cpu(),
+                max_size=self.archive_size,
+                keep_highest=True,
+            )
+
+        if bad_mask.any():
+            self.archive_bad_anchors, self.archive_bad_scores = _update_anchor_bank(
+                bank_anchors=self.archive_bad_anchors,
+                bank_scores=self.archive_bad_scores,
+                new_anchors=x0_preds[bad_mask].detach().cpu(),
+                new_scores=reward_tensor[bad_mask].detach().cpu(),
+                max_size=self.archive_size,
+                keep_highest=False,
+            )
+
+    def _get_archive_guidance_anchors(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        good_anchor_x0 = None
+        bad_anchor_x0 = None
+
+        num_good = 0 if self.archive_good_anchors is None else int(self.archive_good_anchors.shape[0])
+        num_bad = 0 if self.archive_bad_anchors is None else int(self.archive_bad_anchors.shape[0])
+
+        if num_good >= self.min_good_anchors and self.archive_good_anchors is not None:
+            good_anchor_x0 = self.archive_good_anchors.to(device=device, dtype=dtype)
+
+        need_bad = self.bad_guidance_strength > 0.0
+        required_bad = max(self.min_bad_anchors, 1) if need_bad else 0
+        if need_bad and num_bad >= required_bad and self.archive_bad_anchors is not None:
+            bad_anchor_x0 = self.archive_bad_anchors.to(device=device, dtype=dtype)
+
+        return good_anchor_x0, bad_anchor_x0
 
     def resample(
         self, *, sampling_idx: int, latents: torch.Tensor, x0_preds: torch.Tensor
@@ -573,24 +810,30 @@ class FKD:
             A tuple containing updated latents and optionally decoded images.
         """
         if self.potential_type == PotentialType.EVOLUTION:
+            in_collection_window = (
+                self.resampling_t_start <= sampling_idx <= self.resampling_t_end
+            )
             resampling_interval = np.arange(
                 self.resampling_t_start, self.resampling_t_end + 1, self.resample_frequency
             )
             guidance_interval = np.arange(
                 self.resampling_t_start, self.resampling_t_end + 1, self.guidance_frequency
             )
+            should_collect = self.use_anchor_archive and in_collection_window
             should_resample = (
                 self.resample_strategy != "none" and sampling_idx in resampling_interval
             )
             should_guide = sampling_idx in guidance_interval
 
-            if not should_resample and not should_guide:
+            if not should_collect and not should_resample and not should_guide:
                 return latents, None
 
             # Evolution steering scores the predicted clean sample x0 and can
             # use the same rewards for both selection and SVGD transport.
             decoded_images = self.latent_to_decode_fn(x0_preds)
             rewards = self.reward_fn(decoded_images)
+            if should_collect:
+                self._update_evolution_archive(x0_preds=x0_preds, rewards=rewards)
             binary_rewards = evolution_steering_binary_rewards(rewards=rewards)
             good_indices = [i for i, y in enumerate(binary_rewards) if y == 1]
             good_anchor_x0 = (
@@ -598,6 +841,7 @@ class FKD:
                 if good_indices
                 else None
             )
+            bad_anchor_x0 = None
 
             if should_resample:
                 resampling_weights = _safe_resampling_weights(
@@ -621,6 +865,26 @@ class FKD:
             if not should_guide:
                 return latents, decoded_images
 
+            if self.use_anchor_archive:
+                enough_burn_in = (
+                    sampling_idx - self.resampling_t_start
+                ) >= self.archive_burn_in_steps
+                if not enough_burn_in:
+                    return latents, decoded_images
+
+                archive_good_anchor_x0, archive_bad_anchor_x0 = self._get_archive_guidance_anchors(
+                    device=latents.device,
+                    dtype=x0_preds.dtype,
+                )
+                need_bad_archive = self.bad_guidance_strength > 0.0
+                if archive_good_anchor_x0 is None:
+                    return latents, decoded_images
+                if need_bad_archive and archive_bad_anchor_x0 is None:
+                    return latents, decoded_images
+
+                good_anchor_x0 = archive_good_anchor_x0
+                bad_anchor_x0 = archive_bad_anchor_x0
+
             alpha_bar_t = None
             if self.alpha_bar_fn is not None:
                 alpha_bar_t = self.alpha_bar_fn(sampling_idx)
@@ -630,8 +894,10 @@ class FKD:
                 binary_rewards=binary_rewards,
                 x0_particles=x0_preds,
                 good_anchor_x0=good_anchor_x0,
+                bad_anchor_x0=bad_anchor_x0,
                 alpha_bar_t=alpha_bar_t,
                 step_size=self.svgd_step_size,
+                bad_guidance_strength=self.bad_guidance_strength,
                 sigma=self.svgd_sigma,
                 device=latents.device,
             )

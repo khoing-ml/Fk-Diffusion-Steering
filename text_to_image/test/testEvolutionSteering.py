@@ -101,6 +101,52 @@ def test_evolution_guidance_frequency():
     assert guided_images is not None, "Decoded images should be returned when guidance runs"
 
 
+def test_evolution_anchor_archive_delays_guidance_until_burn_in():
+    """
+    Archive-based evolution should collect anchors first and only guide after burn-in.
+    """
+    def mock_reward_fn(images):
+        return torch.tensor([0.2, 0.8, 0.5, 0.9])
+
+    fkd = FKD(
+        potential_type=PotentialType.EVOLUTION,
+        lmbda=1.0,
+        num_particles=4,
+        adaptive_resampling=False,
+        resample_frequency=1,
+        resampling_t_start=0,
+        resampling_t_end=10,
+        time_steps=10,
+        reward_fn=mock_reward_fn,
+        guidance_frequency=1,
+        use_anchor_archive=True,
+        archive_size=8,
+        archive_good_quantile=0.75,
+        archive_bad_quantile=0.25,
+        archive_burn_in_steps=2,
+        min_good_anchors=1,
+        min_bad_anchors=0,
+        resample_strategy="none",
+        device=torch.device("cpu"),
+    )
+
+    latents = torch.randn(4, 3, 16, 16)
+    x0_preds = torch.randn(4, 3, 16, 16)
+
+    warmup_latents, warmup_images = fkd.resample(
+        sampling_idx=0, latents=latents.clone(), x0_preds=x0_preds.clone()
+    )
+    assert torch.allclose(warmup_latents, latents), "Latents should stay unchanged during archive warm-up"
+    assert warmup_images is not None, "Warm-up step should still decode and score samples for collection"
+    assert fkd.archive_good_anchors is not None, "Archive should collect good anchors during warm-up"
+
+    guided_latents, guided_images = fkd.resample(
+        sampling_idx=2, latents=latents.clone(), x0_preds=x0_preds.clone()
+    )
+    assert not torch.allclose(guided_latents, latents), "Latents should change once archive burn-in is satisfied"
+    assert guided_images is not None, "Guided archive step should return decoded images"
+
+
 def test_rbf_kernel():
     """
     Test RBF kernel computation.
