@@ -200,11 +200,16 @@ def run_mode(
     svgd_sigma: float | None,
     guidance_reward_fn: str,
     resample_strategy: str,
+    evolution_resample_strategy: str,
 ):
     if mode not in VALID_MODES:
         raise ValueError(f"Unknown mode: {mode}")
 
     seed_everything(seed)
+
+    effective_resample_strategy = (
+        evolution_resample_strategy if mode == "evolution" else resample_strategy
+    )
 
     if mode == "base":
         fkd_args = build_fkd_args(
@@ -216,7 +221,7 @@ def run_mode(
             guidance_reward_fn=guidance_reward_fn,
             svgd_step_size=svgd_step_size,
             svgd_sigma=svgd_sigma,
-            resample_strategy=resample_strategy,
+            resample_strategy=effective_resample_strategy,
         )
     else:
         fkd_args = build_fkd_args(
@@ -228,7 +233,7 @@ def run_mode(
             guidance_reward_fn=guidance_reward_fn,
             svgd_step_size=svgd_step_size,
             svgd_sigma=svgd_sigma,
-            resample_strategy=resample_strategy,
+            resample_strategy=effective_resample_strategy,
         )
 
     prompts = [prompt] * num_particles
@@ -285,6 +290,15 @@ def parse_args() -> argparse.Namespace:
         default="multinomial",
         choices=["multinomial", "systematic", "stratified", "residual", "none"],
         help="Particle resampling strategy for SMC/FKD updates.",
+    )
+    p.add_argument(
+        "--evolution-resample-strategy",
+        default="none",
+        choices=["multinomial", "systematic", "stratified", "residual", "none"],
+        help=(
+            "Resampling strategy used only for evolution mode. Defaults to 'none' "
+            "because cloning winners tends to collapse diversity."
+        ),
     )
     p.add_argument(
         "--resample-strategies",
@@ -437,6 +451,7 @@ def main() -> None:
     print(f"  seeds          = {seeds}")
     print(f"  svgd_step_sizes= {svgd_step_sizes}")
     print(f"  resample_strategies = {resample_strategies}")
+    print(f"  evolution_resample_strategy = {args.evolution_resample_strategy}")
 
     pipe = get_model(args.model_name).to(device)
 
@@ -465,16 +480,18 @@ def main() -> None:
                         svgd_sigma=args.svgd_sigma,
                         guidance_reward_fn=args.guidance_reward_fn,
                         resample_strategy=resample_strategy,
+                        evolution_resample_strategy=args.evolution_resample_strategy,
                     )
 
+                    effective_resample_strategy = fkd_args["resample_strategy"]
                     out_path = output_dir / (
-                        f"{mode}_rs-{resample_strategy}_seed{seed}_step{svgd_step_size:.4f}.png"
+                        f"{mode}_rs-{effective_resample_strategy}_seed{seed}_step{svgd_step_size:.4f}.png"
                     )
                     show_or_save_images(
                         images=images,
                         rewards=rewards,
                         title=(
-                            f"{args.model_name} | mode={mode} | rs={resample_strategy} | "
+                            f"{args.model_name} | mode={mode} | rs={effective_resample_strategy} | "
                             f"seed={seed} | svgd_step_size={svgd_step_size}"
                         ),
                         out_path=out_path,
@@ -484,7 +501,7 @@ def main() -> None:
                     rows.append(
                         {
                             "mode": mode,
-                            "resample_strategy": resample_strategy,
+                            "resample_strategy": effective_resample_strategy,
                             "seed": seed,
                             "svgd_step_size": svgd_step_size,
                             "mean": float(rewards.mean()),

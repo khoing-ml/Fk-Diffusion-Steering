@@ -197,6 +197,38 @@ def _median_pairwise_distance(x: torch.Tensor) -> float:
     return float(median_dist)
 
 
+def _unique_anchor_particles(anchors: torch.Tensor) -> torch.Tensor:
+    """Drop exact duplicate anchors so cloned winners do not dominate the mixture score."""
+    if anchors.numel() == 0 or anchors.shape[0] <= 1:
+        return anchors
+
+    flat = anchors.reshape(anchors.shape[0], -1)
+    flat_unique = flat.float() if flat.dtype in (torch.float16, torch.bfloat16) else flat
+    unique_flat = torch.unique(flat_unique, dim=0)
+    return unique_flat.to(device=anchors.device, dtype=anchors.dtype).reshape(
+        -1, *anchors.shape[1:]
+    )
+
+
+def _clip_vector_field(
+    vector_field: torch.Tensor,
+    *,
+    max_particle_norm: float = 1.0,
+) -> torch.Tensor:
+    """Clip overly large particle updates while preserving relative magnitudes."""
+    if max_particle_norm <= 0:
+        return torch.zeros_like(vector_field)
+
+    field_flat = vector_field.reshape(vector_field.shape[0], -1)
+    field_norm = torch.norm(field_flat, dim=1, keepdim=True)
+    scale = torch.clamp(
+        max_particle_norm / torch.clamp(field_norm, min=1e-8),
+        max=1.0,
+    )
+    scale = scale.reshape(-1, *([1] * (len(vector_field.shape) - 1)))
+    return vector_field * scale
+
+
 def _score_xt_given_x0_mixture(
     *,
     xt_flat: torch.Tensor,
@@ -333,6 +365,7 @@ def compute_svgd_vector_field(
     binary_rewards: list[int],
     *,
     x0_particles: Optional[torch.Tensor] = None,
+    good_anchor_x0: Optional[torch.Tensor] = None,
     alpha_bar_t: Optional[float] = None,
     sigma: Optional[float] = None,
     device: torch.device = torch.device('cuda'),
@@ -356,6 +389,8 @@ def compute_svgd_vector_field(
         particles: Particle population of shape (num_particles, *spatial_dims)
         binary_rewards: Binary labels (0=bad, 1=good) for each particle
         x0_particles: Predicted clean samples x0 aligned with particles, shape compatible with `particles`.
+        good_anchor_x0: Optional explicit good-anchor set. Useful for evolution steering
+            when the current particle population already contains resampled duplicates.
         alpha_bar_t: Forward diffusion alpha_bar at the current timestep.
         sigma: Bandwidth for RBF kernel. If None, uses median pairwise distance.
         device: Device for computation
@@ -364,11 +399,12 @@ def compute_svgd_vector_field(
         Vector field (velocities) of shape (num_particles, *spatial_dims)
     """
     good_indices = [i for i, y in enumerate(binary_rewards) if y == 1]
-    if len(good_indices) == 0:
-        return torch.zeros_like(particles)
 
-    if x0_particles is not None and alpha_bar_t is not None:
+    if good_anchor_x0 is None and x0_particles is not None and len(good_indices) > 0:
         good_anchor_x0 = x0_particles[good_indices]
+
+    if good_anchor_x0 is not None and alpha_bar_t is not None:
+        good_anchor_x0 = _unique_anchor_particles(good_anchor_x0)
         return _compute_svgd_vector_field_mixture_score(
             xt_particles=particles,
             x0_good_anchors=good_anchor_x0,
@@ -376,6 +412,9 @@ def compute_svgd_vector_field(
             device=device,
             alpha_bar_t=float(alpha_bar_t),
         )
+
+    if len(good_indices) == 0:
+        return torch.zeros_like(particles)
 
     return _compute_svgd_vector_field_transport(
         particles=particles,
@@ -389,6 +428,7 @@ def apply_svgd_steering(
     particles: torch.Tensor,
     binary_rewards: list[int],
     x0_particles: Optional[torch.Tensor] = None,
+    good_anchor_x0: Optional[torch.Tensor] = None,
     alpha_bar_t: Optional[float] = None,
     step_size: float = 0.1,
     sigma: Optional[float] = None,
@@ -413,21 +453,16 @@ def apply_svgd_steering(
         particles=particles,
         binary_rewards=binary_rewards,
         x0_particles=x0_particles,
+        good_anchor_x0=good_anchor_x0,
         alpha_bar_t=alpha_bar_t,
         sigma=sigma,
         device=device,
     )
-    
-    # Normalize vector field to prevent explosions
-    field_norm = torch.norm(vector_field.reshape(vector_field.shape[0], -1), dim=1, keepdim=True)
-    field_norm = field_norm.reshape(-1, *([1] * (len(vector_field.shape) - 1)))
-    field_norm = torch.clamp(field_norm, min=1e-8)
-    normalized_field = vector_field / field_norm
-    
-    # Apply steering
-    steered_particles = particles + step_size * normalized_field
-    
-    return steered_particles
+
+    # Clip only oversized updates so weak fields stay weak instead of being
+    # normalized to the same step size as strong fields.
+    clipped_field = _clip_vector_field(vector_field, max_particle_norm=1.0)
+    return particles + step_size * clipped_field
 
 
 class FKD:
@@ -545,6 +580,12 @@ class FKD:
 
         if self.potential_type == PotentialType.EVOLUTION:
             binary_rewards = evolution_steering_binary_rewards(rewards=rewards)
+            good_indices = [i for i, y in enumerate(binary_rewards) if y == 1]
+            good_anchor_x0 = (
+                _unique_anchor_particles(x0_preds[good_indices])
+                if good_indices
+                else None
+            )
 
             if self.resample_strategy != "none":
                 resampling_weights = _safe_resampling_weights(
@@ -573,6 +614,7 @@ class FKD:
                 particles=latents,
                 binary_rewards=binary_rewards,
                 x0_particles=x0_preds,
+                good_anchor_x0=good_anchor_x0,
                 alpha_bar_t=alpha_bar_t,
                 step_size=self.svgd_step_size,
                 sigma=self.svgd_sigma,

@@ -201,6 +201,45 @@ def test_svgd_vector_field_mixture_score():
     print("SVGD mixture-score test passed.")
 
 
+def test_svgd_vector_field_dedupes_good_anchors():
+    """
+    Duplicated good anchors from resampling should not change the mixture score.
+    """
+    device = torch.device("cpu")
+    xt_particles = torch.tensor(
+        [
+            [0.0, 0.0],
+            [0.5, 0.5],
+            [1.0, 1.0],
+        ]
+    )
+    good_anchor = torch.tensor([[2.0, 2.0]])
+    duplicated_good_anchors = torch.cat([good_anchor, good_anchor], dim=0)
+
+    field_single = compute_svgd_vector_field(
+        particles=xt_particles,
+        binary_rewards=[0, 0, 1],
+        good_anchor_x0=good_anchor,
+        alpha_bar_t=0.8,
+        sigma=None,
+        device=device,
+    )
+    field_dup = compute_svgd_vector_field(
+        particles=xt_particles,
+        binary_rewards=[0, 0, 1],
+        good_anchor_x0=duplicated_good_anchors,
+        alpha_bar_t=0.8,
+        sigma=None,
+        device=device,
+    )
+
+    assert torch.allclose(field_single, field_dup, atol=1e-5), (
+        "Duplicated anchors should not overweight the mixture-score target"
+    )
+
+    print("SVGD good-anchor dedupe test passed.")
+
+
 def test_apply_svgd_steering():
     """
     Test SVGD steering application to particles.
@@ -262,6 +301,9 @@ if __name__ == "__main__":
 
     test_svgd_vector_field_mixture_score()
     print("✓ SVGD mixture-score test passed.")
+
+    test_svgd_vector_field_dedupes_good_anchors()
+    print("✓ SVGD good-anchor dedupe test passed.")
     
     test_apply_svgd_steering()
     print("✓ SVGD steering test passed.")

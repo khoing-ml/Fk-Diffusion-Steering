@@ -94,6 +94,24 @@ def _compute_transport_vector_field(
     return vector_field.reshape(particle_shape)
 
 
+def _clip_vector_field(
+    vector_field: torch.Tensor,
+    *,
+    max_particle_norm: float = 1.0,
+) -> torch.Tensor:
+    if max_particle_norm <= 0:
+        return torch.zeros_like(vector_field)
+
+    field_flat = vector_field.reshape(vector_field.shape[0], -1)
+    field_norm = torch.norm(field_flat, dim=1, keepdim=True)
+    scale = torch.clamp(
+        max_particle_norm / torch.clamp(field_norm, min=1e-8),
+        max=1.0,
+    )
+    scale = scale.reshape(-1, *([1] * (len(vector_field.shape) - 1)))
+    return vector_field * scale
+
+
 def apply_evo_adjustment(
     latents: torch.Tensor,
     rewards: torch.Tensor | np.ndarray | list | tuple,
@@ -103,13 +121,8 @@ def apply_evo_adjustment(
 ) -> torch.Tensor:
     labels = binary_good_bad_labels(rewards)
     vector_field = _compute_transport_vector_field(latents, labels, sigma=sigma)
-
-    field_norm = torch.norm(vector_field.reshape(vector_field.shape[0], -1), dim=1, keepdim=True)
-    field_norm = field_norm.reshape(-1, *([1] * (len(vector_field.shape) - 1)))
-    field_norm = torch.clamp(field_norm, min=1e-8)
-    normalized_field = vector_field / field_norm
-
-    return latents + step_size * normalized_field
+    clipped_field = _clip_vector_field(vector_field, max_particle_norm=1.0)
+    return latents + step_size * clipped_field
 
 
 def decode_latents_to_pil(pipe, latents: torch.Tensor):
@@ -148,7 +161,8 @@ def build_evo_step_callback(
             return callback_kwargs
 
         with torch.no_grad():
-            pil_images = decode_latents_to_pil(pipe, latents)
+            reward_eval_latents = callback_kwargs.get("pred_original_sample", latents)
+            pil_images = decode_latents_to_pil(pipe, reward_eval_latents)
             rewards = get_reward_function(
                 evo_cfg.guidance_reward_fn,
                 images=pil_images,
